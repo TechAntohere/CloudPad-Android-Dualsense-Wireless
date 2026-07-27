@@ -387,6 +387,16 @@ class DualSenseBtStreamFeedback(context: Context)
     @Volatile private var speakerPreviewPackets: List<DualSenseBtSpeakerAudio.DualFramePacket>? = null
     private var speakerThread: Thread? = null
     @Volatile private var speakerThreadRunning = false
+
+    /**
+     * Count of isochronous slots skipped because a BT stall pushed the send
+     * deadline into the past. Pair this against ControllerSpeakerBus's
+     * overflowDrops / emptyPops when chasing audible stutters: whichever
+     * counter tracks the dropouts identifies the cause (stall vs producer
+     * clock drift). See TechAntohere/Senshi#1.
+     */
+    @Volatile var speakerDeadlineSkips = 0L
+        private set
     private var jackPollerThread: Thread? = null
     @Volatile private var jackPollerRunning = false
     @Volatile var controllerJackStateCallback: ((Boolean) -> Unit)? = null
@@ -1277,11 +1287,18 @@ class DualSenseBtStreamFeedback(context: Context)
                 val popDeadline = nextDeadlineNs - 2_000_000L
                 while(ControllerSpeakerBus.depth() < 1 && SystemClock.elapsedRealtimeNanos() < popDeadline && speakerThreadRunning)
                     LockSupport.parkNanos(300_000L)
-                val opus1 = ControllerSpeakerBus.popFrame() ?: zeroOpus
+                // Underrun must emit a REAL encoded silence packet, not 200 zero
+                // bytes: 0x00 is a SILK-mode mono TOC, so feeding it mid
+                // CELT-stereo stream makes the firmware decoder swallow a
+                // codec/channel switch and renders as an artifact rather than
+                // silence. zeroOpus stays only as a last resort if the service
+                // never published a silence frame. See TechAntohere/Senshi#1.
+                val underrunFrame = ControllerSpeakerBus.getSilenceFrame() ?: zeroOpus
+                val opus1 = ControllerSpeakerBus.popFrame() ?: underrunFrame
                 val pop2Deadline = nextDeadlineNs - 1_000_000L
                 while(ControllerSpeakerBus.depth() < 1 && SystemClock.elapsedRealtimeNanos() < pop2Deadline && speakerThreadRunning)
                     LockSupport.parkNanos(200_000L)
-                val opus2 = ControllerSpeakerBus.popFrame() ?: zeroOpus
+                val opus2 = ControllerSpeakerBus.popFrame() ?: underrunFrame
                 val report = DualSenseBtSpeakerAudio.buildTwoFrameReport(
                     DualSenseBtSpeakerAudio.DualFramePacket(
                         opus1 = opus1,
@@ -1298,13 +1315,32 @@ class DualSenseBtStreamFeedback(context: Context)
                 parkSpeakerUntil(nextDeadlineNs)
                 sendSpeakerReport(liveBridge, report, resolveSpeakerTransport(liveBridge))
                 nextDeadlineNs += periodNs
-                // Drift guard: if a BT stall pushed the new deadline into the past,
-                // clamp forward by a quarter-period so the next pop-wait has time to
-                // fill before we fire again. Without this, a single slow send causes
-                // back-to-back sends that drain the frame buffer and cause silence.
+                // Drift guard. The pad consumes audio on a strict isochronous
+                // grid: exactly one report per period. Lateness must NOT be
+                // repaid -- arriving early, even once, overflows a shallow
+                // firmware-side intake buffer and audibly cuts out.
+                //
+                // The previous rule (nowAfterSend + periodNs/4) did exactly
+                // that: it scheduled the next report ~5 ms after a late one,
+                // off-grid, producing the late-then-early pattern that triggers
+                // the dropout. Instead advance by WHOLE periods until at least
+                // one full period ahead, staying on the original grid, and drop
+                // the frames belonging to the slots we skipped rather than
+                // playing them back late. The haptics writer already does this.
+                // See hifihedgehog, TechAntohere/Senshi#1.
                 val nowAfterSendNs = SystemClock.elapsedRealtimeNanos()
                 if(nextDeadlineNs < nowAfterSendNs)
-                    nextDeadlineNs = nowAfterSendNs + periodNs / 4
+                {
+                    var skippedSlots = 0
+                    while(nextDeadlineNs < nowAfterSendNs + periodNs)
+                    {
+                        nextDeadlineNs += periodNs
+                        skippedSlots++
+                    }
+                    // Two Opus frames per report.
+                    repeat(skippedSlots * 2) { ControllerSpeakerBus.popFrame() }
+                    speakerDeadlineSkips += skippedSlots
+                }
             }
             else
             {

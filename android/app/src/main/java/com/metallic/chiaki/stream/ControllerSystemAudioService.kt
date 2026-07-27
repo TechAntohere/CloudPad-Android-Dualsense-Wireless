@@ -249,8 +249,14 @@ class ControllerSystemAudioService : Service() {
         val opusOut = ByteArray(DualSenseBtSpeakerAudio.OPUS_BYTES_PER_FRAME)
         val silenceOpus = ByteArray(DualSenseBtSpeakerAudio.OPUS_BYTES_PER_FRAME)
         val silenceBytes = encoder.encode(ShortArray(SAMPLES_INTERLEAVED), SAMPLES_PER_CHANNEL, silenceOpus, silenceOpus.size)
-        if (silenceBytes > 0) {
-            ControllerSpeakerBus.setSilenceFrame(silenceOpus.copyOf(silenceBytes).padTo(DualSenseBtSpeakerAudio.OPUS_BYTES_PER_FRAME))
+        // Only publish the silence frame if the encoder produced a full hard-CBR
+        // packet. Zero-padding a short packet up to 200 bytes re-introduces a
+        // non-CBR frame, which is the same class of bug as the zero-filled
+        // underrun fallback it exists to replace. See TechAntohere/Senshi#1.
+        if (silenceBytes == DualSenseBtSpeakerAudio.OPUS_BYTES_PER_FRAME) {
+            ControllerSpeakerBus.setSilenceFrame(silenceOpus.copyOf(silenceBytes))
+        } else if (silenceBytes > 0) {
+            Log.w(TAG, "Silence frame not hard-CBR ($silenceBytes/${DualSenseBtSpeakerAudio.OPUS_BYTES_PER_FRAME} bytes); not publishing it")
         }
 
         record.startRecording()
@@ -289,11 +295,21 @@ class ControllerSystemAudioService : Service() {
 
                 val nb = encoder.encode(pcmFrame, SAMPLES_PER_CHANNEL, opusOut, opusOut.size)
 
-                val opus = if (nb > 0) opusOut.copyOf(nb).padTo(DualSenseBtSpeakerAudio.OPUS_BYTES_PER_FRAME)
-                           else ByteArray(DualSenseBtSpeakerAudio.OPUS_BYTES_PER_FRAME)
+                // Only genuine hard-CBR packets may reach the firmware decoder.
+                // A short packet zero-padded up to 200 bytes, or an all-zero
+                // buffer on encode failure, decodes to warble and can desync the
+                // stream. Publish the encoded silence frame instead when the
+                // encoder gives us anything else. See TechAntohere/Senshi#1.
+                val opus = if (nb == DualSenseBtSpeakerAudio.OPUS_BYTES_PER_FRAME)
+                               opusOut.copyOf(nb)
+                           else
+                               ControllerSpeakerBus.getSilenceFrame()
 
                 // Push to speaker bus — btFeedback's speakerLoop drains and sends via its own bridge
-                ControllerSpeakerBus.onSpeakerFrame(opus)
+                if (opus != null)
+                    ControllerSpeakerBus.onSpeakerFrame(opus)
+                else if (nb != DualSenseBtSpeakerAudio.OPUS_BYTES_PER_FRAME)
+                    Log.w(TAG, "Dropping non-CBR speaker frame ($nb bytes) with no silence frame available")
             }
         } catch (e: InterruptedException) {
             // normal stop

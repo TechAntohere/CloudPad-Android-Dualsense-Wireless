@@ -90,8 +90,11 @@ object DualSenseStreamAudioRouter {
         val enc = ensureEncoderLocked()
         val silence = ShortArray(OUTPUT_INTERLEAVED)
         val bytes = enc.encode(silence, OUTPUT_SAMPLES_PER_CHANNEL, opusOut, opusOut.size)
-        if(bytes > 0)
-            ControllerSpeakerBus.setSilenceFrame(opusOut.copyOf(bytes).copyOf(DualSenseBtSpeakerAudio.OPUS_BYTES_PER_FRAME))
+        // Must be a full hard-CBR packet; zero-padding a short one back up to
+        // 200 bytes yields a frame the firmware decoder mishandles, defeating
+        // the point of having a real silence frame. See TechAntohere/Senshi#1.
+        if(bytes == DualSenseBtSpeakerAudio.OPUS_BYTES_PER_FRAME)
+            ControllerSpeakerBus.setSilenceFrame(opusOut.copyOf(bytes))
     }
 
     private fun encodeAccumulatedFrameLocked() {

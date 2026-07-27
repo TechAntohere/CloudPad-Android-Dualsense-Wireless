@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.text.format.DateUtils
 import android.util.TypedValue
+import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -19,7 +20,16 @@ import com.pylux.stream.databinding.ItemFriendBinding
  *  Friends tab so both present an identical friends list from the same fetched data. */
 class FriendAdapter(
 	private val onFriendClick: (Friend) -> Unit,
-	private val onCompareTrophiesClick: (Friend) -> Unit
+	private val onCompareTrophiesClick: (Friend) -> Unit,
+	/** Only supplied by [FriendsActivity] — its toolbar back button is otherwise unreachable by
+	 *  D-pad from the first row, since RecyclerView.focusSearch() contains arrow-key search to its
+	 *  own subtree rather than escaping to a sibling control outside the list (see
+	 *  [com.metallic.chiaki.common.ext.redirectDpadUpAtListBoundary] for the general case this is
+	 *  a hand-rolled variant of — moveFocusVertically below already has its own column-locked
+	 *  redirect logic, so the boundary check is folded in here instead of reusing that helper).
+	 *  Left null for [com.metallic.chiaki.stream.QuickSettingsPanel]'s Friends tab, which has no
+	 *  such button to escape to. */
+	private val onTopBoundary: (() -> Unit)? = null
 ) : RecyclerView.Adapter<FriendAdapter.FriendViewHolder>()
 {
 	companion object
@@ -82,6 +92,64 @@ class FriendAdapter(
 			holder.items()?.let { onCompareTrophiesClick(it) }
 		}
 
+		// Each row has two side-by-side focusable targets (the tile and the compare-trophies
+		// button). Left to the platform's default geometric focus search, D-pad up/down can drift
+		// from one column to the other while scrolling through recycled rows — the button's much
+		// smaller bounds compared to the tile make it an unreliable target for the "nearest in this
+		// direction" heuristic once rows are being bound/recycled mid-scroll. Intercepting up/down
+		// explicitly and re-requesting focus on the *same* column of the adjacent row keeps
+		// navigation column-locked regardless of recycling.
+		val recyclerView = parent as RecyclerView
+		fun moveFocusVertically(keyCode: Int, event: KeyEvent, sameColumn: (FriendViewHolder) -> View): Boolean
+		{
+			if (event.action != KeyEvent.ACTION_DOWN) return false
+			val direction = when (keyCode)
+			{
+				KeyEvent.KEYCODE_DPAD_UP -> -1
+				KeyEvent.KEYCODE_DPAD_DOWN -> 1
+				else -> return false
+			}
+			val pos = holder.bindingAdapterPosition
+			if (pos == RecyclerView.NO_POSITION) return false
+			val targetPos = pos + direction
+			if (targetPos < 0)
+			{
+				// Top row, pressed up — nothing left within the list to move to. Redirect to the
+				// screen's back button if one was supplied (expected to flip
+				// isFocusableInTouchMode = true before requestFocus() — see
+				// redirectDpadUpAtListBoundary's doc comment for why requestFocus() alone silently
+				// fails here), otherwise fall through to default handling (unchanged from before
+				// this existed).
+				val boundary = onTopBoundary ?: return false
+				boundary()
+				return true
+			}
+			if (targetPos >= items.size) return false
+
+			val existing = recyclerView.findViewHolderForAdapterPosition(targetPos) as? FriendViewHolder
+			if (existing != null)
+			{
+				sameColumn(existing).requestFocus()
+			}
+			else
+			{
+				// Target row has scrolled out of the view cache and isn't bound yet — bring it
+				// into view first, then focus once it's attached.
+				recyclerView.scrollToPosition(targetPos)
+				recyclerView.post {
+					(recyclerView.findViewHolderForAdapterPosition(targetPos) as? FriendViewHolder)
+						?.let { sameColumn(it).requestFocus() }
+				}
+			}
+			return true
+		}
+		binding.friendItemContent.setOnKeyListener { _, keyCode, event ->
+			moveFocusVertically(keyCode, event) { it.contentView }
+		}
+		binding.friendItemCompareTrophiesButton.setOnKeyListener { _, keyCode, event ->
+			moveFocusVertically(keyCode, event) { it.trophyButtonView }
+		}
+
 		return holder
 	}
 
@@ -93,6 +161,9 @@ class FriendAdapter(
 	{
 		private var friend: Friend? = null
 		fun items(): Friend? = friend
+
+		val contentView: View get() = binding.friendItemContent
+		val trophyButtonView: View get() = binding.friendItemCompareTrophiesButton
 
 		fun bind(friend: Friend)
 		{

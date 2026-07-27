@@ -189,6 +189,19 @@ class MainActivity : AppCompatActivity() {
         binding.viewPager.offscreenPageLimit = 1
         // Disable swipe - only header buttons switch tabs (avoids accidental swipes when scrolling)
         binding.viewPager.isUserInputEnabled = false
+        // ViewPager2 is itself backed by an internal RecyclerView (its actual paging container,
+        // a sibling of both fragments' roots, not something applyViewPagerPageFocusIsolation's
+        // per-fragment-root blocking below ever touches) — confirmed on-device via uiautomator
+        // that this RecyclerView, not any view inside the page's own content, is what receives
+        // focus when D-pad navigating from the tab header into a page whose real target (e.g.
+        // Cloud Play's "LOGIN" button, several ViewGroups deep) isn't the nearest geometric match.
+        // Same root cause as ScrollView's own default focusability elsewhere in this app: a
+        // scrollable container is focusable by default so D-pad/trackball scrolling still works
+        // with nothing else focused, which here means the *entire visible page* shows a focus
+        // highlight instead of any real control. FOCUS_AFTER_DESCENDANTS defers to real
+        // descendants first, only falling back to the pager itself if a page has none.
+        (binding.viewPager.getChildAt(0) as? RecyclerView)?.descendantFocusability =
+            ViewGroup.FOCUS_AFTER_DESCENDANTS
 
         // Mode icon click handlers (bound to FrameLayout containers for D-pad focus support)
         binding.remotePlayButton.setOnClickListener {
@@ -255,6 +268,22 @@ class MainActivity : AppCompatActivity() {
         if (event.action != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
         if (event.keyCode == KeyEvent.KEYCODE_BACK) return super.dispatchKeyEvent(event)
 
+        // While a tile's favourite/trophies/playtime/shortcut icons are being controller-navigated
+        // (CloudGameAdapter.isIconNavActive, entered via Select), let D-pad events go straight to
+        // the focused icon's own key listener instead of this method's row/boundary logic below —
+        // that logic reasons about tile positions in the grid, not icon positions within a tile,
+        // and would otherwise block or misroute movement between the four icons.
+        if (currentPage == 1) {
+            val cloudAdapter = window.decorView.findViewById<RecyclerView>(R.id.gamesRecyclerView)?.adapter as? CloudGameAdapter
+            if (cloudAdapter?.isIconNavActive == true && event.keyCode in setOf(
+                    KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
+                    KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT
+                )
+            ) {
+                return super.dispatchKeyEvent(event)
+            }
+        }
+
         if (currentPage == 1) {
             val cloudFragment = supportFragmentManager.fragments
                 .filterIsInstance<CloudPlayFragment>()
@@ -283,7 +312,15 @@ class MainActivity : AppCompatActivity() {
         // Any of these are valid focus targets but dead-end D-pad navigation since none of them
         // are a real tile — game/host tiles are always CardViews, never RecyclerViews. Treat
         // this the same as "nothing focused" and recover onto the first visible tile.
-        if (focused == null || focused is RecyclerView) {
+        //
+        // !focused.isAttachedToWindow catches a related case: holding/repeatedly pressing D-pad
+        // down can recycle the focused card faster than the platform's own focus-restoration
+        // resolves a replacement, leaving currentFocus pointing at a view that's been detached
+        // (recycled) but not yet nulled out — neither of the checks above catches that, and
+        // routing it into super.dispatchKeyEvent() below lets Android's default focus search run
+        // against a stale/detached view, which is what actually produced the reported "focus
+        // jumps all the way up to the toolbar" symptom during a fast press burst.
+        if (focused == null || focused is RecyclerView || !focused.isAttachedToWindow) {
             if (currentPage == 1) {
                 val lm = cloudRv?.layoutManager as? GridLayoutManager
                 lm?.findViewByPosition(lm.findFirstVisibleItemPosition())?.let {
@@ -322,42 +359,43 @@ class MainActivity : AppCompatActivity() {
         val isSpeedDialOpen =
             window.decorView.findViewById<View>(R.id.addManualButton)?.isShown == true
 
+        // requestFocusFromTouch() can still silently fail here even though this only ever runs
+        // from a real KeyEvent (confirmed on-device — same gotcha documented on
+        // redirectDpadUpAtListBoundary/chatHistoryTarget: the device can still read as "in touch
+        // mode" at this exact point), so isFocusableInTouchMode has to be flipped on for the call
+        // to reliably land. It's flipped back off immediately after, rather than left standing —
+        // leaving it permanently true is what caused the ps3TabButton "needs two touches" bug
+        // (focusSecondaryHeader is reached on nearly every D-pad up/down through the grid, so it's
+        // the one that surfaced first, but all five of these had the same latent issue).
+        fun View.focusFromTouchThenClearFlag() {
+            isFocusableInTouchMode = true
+            requestFocusFromTouch()
+            isFocusableInTouchMode = false
+        }
+
         fun focusPrimaryHeader() {
             val btn = if (currentPage == 0) binding.remotePlayButton else binding.cloudPlayButton
-            btn.isFocusableInTouchMode = true
-            btn.requestFocusFromTouch()
+            btn.focusFromTouchThenClearFlag()
         }
 
         fun focusSecondaryHeader() {
-            window.decorView.findViewById<View>(R.id.ps3TabButton)?.let {
-                it.isFocusableInTouchMode = true
-                it.requestFocusFromTouch()
-            }
+            window.decorView.findViewById<View>(R.id.ps3TabButton)?.focusFromTouchThenClearFlag()
         }
 
         fun focusFab() {
-            window.decorView.findViewById<View>(R.id.floatingActionButton)?.let {
-                it.isFocusableInTouchMode = true
-                it.requestFocusFromTouch()
-            }
+            window.decorView.findViewById<View>(R.id.floatingActionButton)?.focusFromTouchThenClearFlag()
         }
 
         fun focusLastConsole() {
             val count = hostRv?.adapter?.itemCount ?: 0
             if (count <= 0) return
             val lastView = hostRv?.layoutManager?.findViewByPosition(count - 1)
-            lastView?.let {
-                it.isFocusableInTouchMode = true
-                it.requestFocusFromTouch()
-            }
+            lastView?.focusFromTouchThenClearFlag()
         }
 
         fun focusLoginButton() {
             window.decorView.findViewById<View>(R.id.loginButton)?.let {
-                if (it.isShown) {
-                    it.isFocusableInTouchMode = true
-                    it.requestFocusFromTouch()
-                }
+                if (it.isShown) it.focusFromTouchThenClearFlag()
             }
         }
 
@@ -386,7 +424,12 @@ class MainActivity : AppCompatActivity() {
                         focusSecondaryHeader(); return true
                     }
 
-                    // Cloud game card in first row → secondary header
+                    // Cloud game card in first row → secondary header; otherwise let native
+                    // focus search move up one row — CloudPlayFragment's games grid uses
+                    // InstantScrollGridLayoutManager, which forces the resulting bring-into-view
+                    // scroll to be immediate rather than animated, so a fast/held burst can't
+                    // queue up overlapping smooth-scroll animations and overshoot or leave focus
+                    // in a transient nowhere-state.
                     focusedInCloud != null -> {
                         val pos = cloudRv!!.getChildAdapterPosition(focusedInCloud)
                         val span = (cloudRv.layoutManager as? GridLayoutManager)?.spanCount ?: 2
@@ -458,11 +501,13 @@ class MainActivity : AppCompatActivity() {
                     // Login button → consume (nothing below it)
                     isLoginButton -> return true
 
-                    // Cloud game card: stop at last item
+                    // Cloud game card: stop once already on the last item, otherwise let native
+                    // focus search move down one row (see the InstantScrollGridLayoutManager note
+                    // in the DPAD_UP branch above for why that's safe under a fast/held burst).
                     focusedInCloud != null -> {
                         val pos = cloudRv!!.getChildAdapterPosition(focusedInCloud)
                         val lastLoaded = (cloudRv.adapter?.itemCount ?: 0) - 1
-                        if (pos < 0 || pos >= lastLoaded) return true
+                        if (pos == RecyclerView.NO_POSITION || pos >= lastLoaded) return true
                         return super.dispatchKeyEvent(event)
                     }
 
@@ -506,6 +551,16 @@ class MainActivity : AppCompatActivity() {
         val focusedInHost = focused?.let { hostRv?.findContainingItemView(it) }
         val activeHeader =
             if (currentPage == 0) binding.remotePlayButton else binding.cloudPlayButton
+
+        // Back should back out of controller icon-navigation mode first, same as a second Select
+        // press — otherwise it'd jump focus straight to the header below and leave the adapter's
+        // icon-nav state pointing at a tile that's no longer being navigated.
+        (cloudRv?.adapter as? CloudGameAdapter)?.let { adapter ->
+            if (adapter.isIconNavActive) {
+                adapter.exitIconNav()
+                return
+            }
+        }
 
         when {
             focusedInCloud != null || focusedInHost != null ||

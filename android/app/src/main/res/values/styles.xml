@@ -159,13 +159,14 @@
     <style name="AppTheme.AlertDialog" parent="Theme.MaterialComponents.Dialog.Alert">
         <item name="android:textColorPrimary">@android:color/primary_text_dark</item>
         <item name="colorPrimary">@color/accent</item>
+        <item name="colorControlActivated">?attr/pyluxAccent</item>
         <item name="materialButtonStyle">@style/AppTheme.AlertDialog.Button</item>
     </style>
 
     <style name="AppTheme.AlertDialog.NonMaterial" parent="Theme.AppCompat.Dialog.Alert">
         <item name="android:textColorPrimary">@android:color/primary_text_dark</item>
         <item name="materialButtonStyle">@style/AppTheme.AlertDialog.Button</item>
-        <item name="colorControlActivated">@color/accent</item>
+        <item name="colorControlActivated">?attr/pyluxAccent</item>
     </style>
 
     <style name="AppTheme.AlertDialog.Button" parent="Widget.MaterialComponents.Button.TextButton.Dialog">
@@ -175,21 +176,25 @@
     <style name="AppTheme.AlertDialog.Blue" parent="Theme.MaterialComponents.Dialog.Alert">
         <item name="android:textColorPrimary">@android:color/primary_text_dark</item>
         <item name="colorPrimary">@color/accent_blue</item>
+        <item name="colorControlActivated">?attr/pyluxAccent</item>
     </style>
 
     <style name="AppTheme.AlertDialog.Green" parent="Theme.MaterialComponents.Dialog.Alert">
         <item name="android:textColorPrimary">@android:color/primary_text_dark</item>
         <item name="colorPrimary">@color/accent_green</item>
+        <item name="colorControlActivated">?attr/pyluxAccent</item>
     </style>
 
     <style name="AppTheme.AlertDialog.Yellow" parent="Theme.MaterialComponents.Dialog.Alert">
         <item name="android:textColorPrimary">@android:color/primary_text_dark</item>
         <item name="colorPrimary">@color/accent_yellow</item>
+        <item name="colorControlActivated">?attr/pyluxAccent</item>
     </style>
 
     <style name="AppTheme.AlertDialog.Orange" parent="Theme.MaterialComponents.Dialog.Alert">
         <item name="android:textColorPrimary">@android:color/primary_text_dark</item>
         <item name="colorPrimary">@color/accent_orange</item>
+        <item name="colorControlActivated">?attr/pyluxAccent</item>
     </style>
 
     <style name="MageTheme" parent="Theme.MaterialComponents.NoActionBar">
@@ -250,6 +255,17 @@
         <item name="android:backgroundTint">?attr/colorSecondary</item>
         <item name="android:textColor">?attr/colorOnSecondary</item>
         <item name="iconTint">?attr/colorOnSecondary</item>
+    </style>
+
+    <!-- Secondary action button: grey fill, white text, theme-accent border -->
+    <style name="MageTheme.Button.Secondary" parent="Widget.MaterialComponents.Button">
+        <item name="tint">@android:color/white</item>
+        <item name="android:backgroundTint">@color/disclaimer_box_background</item>
+        <item name="android:textColor">@android:color/white</item>
+        <item name="iconTint">@android:color/white</item>
+        <item name="strokeColor">?attr/colorAccent</item>
+        <item name="strokeWidth">2dp</item>
+        <item name="rippleColor">?attr/colorAccent</item>
     </style>
 
     <style name="MageTheme.TextAppearanceButton" parent="TextAppearance.MaterialComponents.Button">

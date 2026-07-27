@@ -5,7 +5,7 @@ package com.metallic.chiaki.trophy
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
-import android.view.MenuItem
+import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
@@ -14,7 +14,9 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import coil.load
 import com.metallic.chiaki.cloudplay.model.CloudGame
 import com.metallic.chiaki.common.Preferences
+import com.metallic.chiaki.common.ext.InstantScrollLinearLayoutManager
 import com.metallic.chiaki.common.ext.fixFocusOnFastScroll
+import com.metallic.chiaki.common.ext.redirectDpadDownTo
 import com.metallic.chiaki.trophy.model.TrophyTitleDetail
 import com.pylux.stream.R
 import com.pylux.stream.databinding.ActivityTrophiesBinding
@@ -40,7 +42,13 @@ class TrophiesActivity : AppCompatActivity()
 
 	private lateinit var binding: ActivityTrophiesBinding
 	private lateinit var repository: TrophyRepository
-	private val adapter = TrophyAdapter(onTrophyClick = { trophy -> showTrophyDetailDialog(this, trophy) })
+	private val adapter = TrophyAdapter(
+		onTrophyClick = { trophy -> showTrophyDetailDialog(this, trophy) },
+		onTopBoundary = {
+			binding.backButton.isFocusableInTouchMode = true
+			binding.backButton.requestFocus()
+		}
+	)
 
 	override fun onCreate(savedInstanceState: Bundle?)
 	{
@@ -60,7 +68,12 @@ class TrophiesActivity : AppCompatActivity()
 		window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
 
 		setSupportActionBar(binding.toolbar)
-		supportActionBar?.setDisplayHomeAsUpEnabled(true)
+		binding.backButton.setOnClickListener { onBackPressedDispatcher.onBackPressed() }
+		binding.backButton.redirectDpadDownTo {
+			val firstTrophyPosition = adapter.items.indexOfFirst { it is TrophyListItem.TrophyRow }
+			if (firstTrophyPosition < 0) return@redirectDpadDownTo null
+			(binding.trophyRecyclerView.layoutManager as? LinearLayoutManager)?.findViewByPosition(firstTrophyPosition)
+		}
 
 		repository = TrophyRepository(prefs)
 
@@ -78,7 +91,7 @@ class TrophiesActivity : AppCompatActivity()
 			binding.trophyHeaderArt.setImageResource(android.R.drawable.ic_menu_gallery)
 		}
 
-		binding.trophyRecyclerView.layoutManager = LinearLayoutManager(this)
+		binding.trophyRecyclerView.layoutManager = InstantScrollLinearLayoutManager(this)
 		binding.trophyRecyclerView.adapter = adapter
 		binding.trophyRecyclerView.descendantFocusability = android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS
 		binding.trophyRecyclerView.fixFocusOnFastScroll("TrophiesActivity")
@@ -149,11 +162,22 @@ class TrophiesActivity : AppCompatActivity()
 		binding.trophyRecyclerView.visibility = View.GONE
 		binding.trophyEmptyStateText.text = message
 		binding.trophyEmptyStateText.visibility = View.VISIBLE
+
+		// No list means nothing else on screen to carry D-pad focus to backButton/refresh via
+		// onTopBoundary/redirectDpadDownTo — land it there directly, same fix as onTopBoundary.
+		binding.backButton.isFocusableInTouchMode = true
+		binding.backButton.requestFocus()
 	}
 
-	override fun onOptionsItemSelected(item: MenuItem): Boolean = when (item.itemId)
+	/** Circle/B as a controller shortcut for the back button — same equivalence QuickSettingsPanel
+	 *  already treats KEYCODE_BACK/KEYCODE_BUTTON_B as. */
+	override fun dispatchKeyEvent(event: KeyEvent): Boolean
 	{
-		android.R.id.home -> { finish(); true }
-		else -> super.onOptionsItemSelected(item)
+		if (event.action == KeyEvent.ACTION_DOWN && event.keyCode == KeyEvent.KEYCODE_BUTTON_B)
+		{
+			onBackPressedDispatcher.onBackPressed()
+			return true
+		}
+		return super.dispatchKeyEvent(event)
 	}
 }

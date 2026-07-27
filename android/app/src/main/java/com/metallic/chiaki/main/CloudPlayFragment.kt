@@ -6,6 +6,7 @@ import android.app.Activity
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Rect
 import android.os.Bundle
 import android.util.Log
 import android.util.TypedValue
@@ -62,6 +63,10 @@ class CloudPlayFragment : Fragment() {
     private var pendingShortcutProductId: String? = null
     private var pendingShortcutServiceType: String? = null
     private var shortcutLaunchInProgress = false
+
+    // Set for the duration of updateGameStreamability()'s synchronous LiveData re-emit, so the
+    // games.observe auto-focus logic can tell that re-emit apart from a genuine catalog reload.
+    private var isConfirmingStreamability = false
 
     // Cloud sub-tabs now in secondary header (binding.cloudSubHeader)
     // Sort state: 0 = Default, 1 = A->Z, 2 = Z->A
@@ -147,7 +152,6 @@ class CloudPlayFragment : Fragment() {
         setupCloudTabs()
         setupSearchView()
         setupSettingsFab()
-        setupScrollListener()
         setupLoginButton()
 
         // Check login status BEFORE observing ViewModel to prevent cached games from showing.
@@ -382,7 +386,7 @@ class CloudPlayFragment : Fragment() {
         binding.gamesRecyclerView.adapter = null
 
         // Recreate layout manager to ensure fresh state
-        val newLayoutManager = GridLayoutManager(requireContext(), spanCount)
+        val newLayoutManager = InstantScrollGridLayoutManager(spanCount)
         binding.gamesRecyclerView.layoutManager = newLayoutManager
 
         // Reattach adapter
@@ -402,34 +406,15 @@ class CloudPlayFragment : Fragment() {
     }
 
     fun toggleSearch() {
-        isSearchExpanded = !isSearchExpanded
-
         if (isSearchExpanded) {
-            binding.searchView.visibility = android.view.View.VISIBLE
-            binding.searchView.layoutParams = binding.searchView.layoutParams.apply {
-                height = android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-            }
-            // Focus the inner EditText directly so TV DPad can reach it
-            val queryEditText =
-                binding.searchView.findViewById<android.view.View>(androidx.appcompat.R.id.search_src_text)
-                    ?: binding.searchView
-            queryEditText.isFocusableInTouchMode = true
-            queryEditText.requestFocus()
-            val imm =
-                requireContext().getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
-            imm.showSoftInput(
-                queryEditText,
-                android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT
-            )
-            binding.headerSearchButton.setColorFilter(
-                resources.getColor(
-                    android.R.color.white,
-                    null
-                )
-            )
-            binding.headerSearchButton.alpha = 1.0f
-        } else {
+            // collapseSearchBar() calls viewModel.setSearchQuery(""), which synchronously
+            // re-emits the games list through the same observer that skips its auto-focus-to-top
+            // logic while isSearchExpanded is true. Flip the flag AFTER collapsing (not before,
+            // as this used to), so that guard is still in effect for this specific re-emit —
+            // otherwise closing the search bar silently scrolled the grid back to the top and
+            // dropped whatever tile/scroll position the user was at.
             collapseSearchBar()
+            isSearchExpanded = false
             binding.headerSearchButton.setColorFilter(
                 resources.getColor(
                     android.R.color.white,
@@ -437,26 +422,27 @@ class CloudPlayFragment : Fragment() {
                 )
             )
             binding.headerSearchButton.alpha = 0.45f
-        }
-    }
-
-    private fun setupScrollListener() {
-        // Hide search bar when scrolling
-        binding.gamesRecyclerView.addOnScrollListener(object :
-            androidx.recyclerview.widget.RecyclerView.OnScrollListener() {
-            override fun onScrolled(
-                recyclerView: androidx.recyclerview.widget.RecyclerView,
-                dx: Int,
-                dy: Int
-            ) {
-                super.onScrolled(recyclerView, dx, dy)
-                if (dy > 0 && isSearchExpanded) {
-                    // Scrolling down - collapse search
-                    isSearchExpanded = false
-                    collapseSearchBar()
-                }
+        } else {
+            isSearchExpanded = true
+            binding.searchView.visibility = android.view.View.VISIBLE
+            binding.searchView.layoutParams = binding.searchView.layoutParams.apply {
+                height = android.view.ViewGroup.LayoutParams.WRAP_CONTENT
             }
-        })
+            // Leave the inner EditText unfocused on open — focus (and the keyboard) should only
+            // land there when the user explicitly taps into the field themselves.
+            val queryEditText =
+                binding.searchView.findViewById<android.view.View>(androidx.appcompat.R.id.search_src_text)
+                    ?: binding.searchView
+            queryEditText.isFocusableInTouchMode = true
+            // Re-apply whatever text is still sitting in the field from last time it was open —
+            // the field itself was never cleared on close, only the active filter was.
+            val previousQuery = binding.searchView.query?.toString().orEmpty()
+            if (previousQuery.isNotEmpty()) {
+                viewModel.setSearchQuery(previousQuery)
+            }
+            binding.headerSearchButton.setColorFilter(resolveAccentColor())
+            binding.headerSearchButton.alpha = 1.0f
+        }
     }
 
     private var isSearchExpanded = false
@@ -466,7 +452,9 @@ class CloudPlayFragment : Fragment() {
         binding.searchView.layoutParams = binding.searchView.layoutParams.apply {
             height = 0
         }
-        // Do NOT clear the query - keep the search filter active so the list stays filtered
+        // Drop the active filter so the full list shows again while the bar is closed, but leave
+        // the typed text in the field itself so reopening the bar restores and re-filters by it.
+        viewModel.setSearchQuery("")
         binding.searchView.clearFocus()
         // Hide keyboard
         val imm =
@@ -557,7 +545,7 @@ class CloudPlayFragment : Fragment() {
             if (favActive) R.drawable.ic_star else R.drawable.ic_star_outline
         )
         binding.headerFavoritesButton.setColorFilter(
-            if (favActive) resources.getColor(android.R.color.holo_orange_light, null)
+            if (favActive) resolveAccentColor()
             else resources.getColor(android.R.color.white, null)
         )
         binding.headerFavoritesButton.alpha = if (favActive) 1.0f else 0.45f
@@ -576,14 +564,18 @@ class CloudPlayFragment : Fragment() {
     }
 
     private fun updateStreamabilityFilterButton() {
-        val (icon, colorRes) = when (streamabilityFilterState) {
-            1 -> R.drawable.ic_check_white to android.R.color.holo_green_light
-            2 -> R.drawable.ic_close_white to android.R.color.holo_red_light
-            3 -> R.drawable.ic_question_white to android.R.color.holo_orange_light
-            else -> R.drawable.ic_apps to android.R.color.white
+        val icon = when (streamabilityFilterState) {
+            1 -> R.drawable.ic_check_white
+            2 -> R.drawable.ic_close_white
+            3 -> R.drawable.ic_question_white
+            else -> R.drawable.ic_apps
         }
+        val color = if (streamabilityFilterState == 0)
+            resources.getColor(android.R.color.white, null)
+        else
+            resolveAccentColor()
         binding.headerStreamabilityFilterButton.setImageResource(icon)
-        binding.headerStreamabilityFilterButton.setColorFilter(resources.getColor(colorRes, null))
+        binding.headerStreamabilityFilterButton.setColorFilter(color)
         binding.headerStreamabilityFilterButton.alpha = if (streamabilityFilterState == 0) 0.45f else 1.0f
     }
 
@@ -676,7 +668,13 @@ class CloudPlayFragment : Fragment() {
         updateFilterButtonText()
         updateFavoritesIcon()
 
-        viewModel.fetchPs5CloudCatalog(showOnlyOwned = true, forceRefresh = true)
+        // Not forceRefresh — this runs on every tab click, tab restore on app launch, and
+        // shortcut routing into this section, so forcing a network refetch every time was
+        // hitting the network far more than needed. CloudGameRepository.fetchOwnedPs5Games
+        // already serves the on-disk cache instantly when present; the header refresh button
+        // (refreshCurrentSectionInternal) and the settings FAB's refresh action still force one
+        // explicitly, which is the manual mechanism this is meant to defer to.
+        viewModel.fetchPs5CloudCatalog(showOnlyOwned = true, forceRefresh = false)
     }
 
     private fun updateOwnedToggleButton() {
@@ -961,6 +959,19 @@ class CloudPlayFragment : Fragment() {
         }
     }
 
+    /** Shown from the tile's own "Add to Home Screen" icon — confirms before pinning, unlike the
+     *  long-press menu's identically-named item which pins immediately. Delegates to
+     *  [onAddShortcutClicked] on confirmation so both paths share the exact same ownership check
+     *  and pin logic. */
+    private fun confirmAddToHomeScreen(game: CloudGame) {
+        requireContext().alertDialogBuilder()
+            .setMessage("Would you like to add ${game.name} to your home screen?")
+            .setPositiveButton("Yes") { _, _ -> onAddShortcutClicked(game) }
+            .setNegativeButton("No", null)
+            .create()
+            .show()
+    }
+
     /** Shown from the long-press "Playtime" menu item — works for PS3/PS4 Catalog and PS5
      *  Library games alike since both accumulate stats under the same productId key
      *  (see StreamActivity.flushStreamTimeSegment / Preferences.recordPlaySession). */
@@ -1007,9 +1018,9 @@ class CloudPlayFragment : Fragment() {
         adapter = CloudGameAdapter(
             onGameClick = this::onGameClicked,
             onFavoriteClick = this::onGameFavoriteToggled,
-            onAddShortcutClick = this::onAddShortcutClicked,
             onPlaytimeClick = this::showPlaytimeDialog,
             onTrophiesClick = { game -> com.metallic.chiaki.trophy.TrophiesActivity.start(requireContext(), game) },
+            onAddToHomeClick = this::confirmAddToHomeScreen,
             isFavorite = { productId -> preferences.isFavoriteGame(productId) }
         )
         binding.gamesRecyclerView.adapter = adapter
@@ -1018,7 +1029,7 @@ class CloudPlayFragment : Fragment() {
         binding.gamesRecyclerView.descendantFocusability =
             android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS
         val spanCount = calculateSpanCount()
-        binding.gamesRecyclerView.layoutManager = GridLayoutManager(requireContext(), spanCount)
+        binding.gamesRecyclerView.layoutManager = InstantScrollGridLayoutManager(spanCount)
 
         // Setup fast scroller
         setupFastScroller()
@@ -1031,7 +1042,6 @@ class CloudPlayFragment : Fragment() {
             touchZone = binding.fastScrollerTouchZone,
             sectionIndicator = binding.sectionIndicator,
             gameCountText = binding.gameCountText,
-            adapter = adapter,
             gamesProvider = { adapter.games }
         )
         fastScrollerHelper.setup()
@@ -1078,6 +1088,19 @@ class CloudPlayFragment : Fragment() {
                 return true
             }
         })
+
+        // AppCompat's default close-button behavior clears the text but then requests focus and
+        // force-shows the keyboard. Override it so clearing the text doesn't also open the
+        // keyboard — that should only happen when the user taps into the field themselves.
+        binding.searchView.findViewById<View>(androidx.appcompat.R.id.search_close_btn)
+            ?.setOnClickListener {
+                binding.searchView.setQuery("", false)
+                binding.searchView.clearFocus()
+                val imm = requireContext().getSystemService(
+                    android.content.Context.INPUT_METHOD_SERVICE
+                ) as android.view.inputmethod.InputMethodManager
+                imm.hideSoftInputFromWindow(binding.searchView.windowToken, 0)
+            }
     }
 
     private fun observeViewModel() {
@@ -1136,8 +1159,24 @@ class CloudPlayFragment : Fragment() {
 
             handlePendingShortcutLaunch(sortedGames)
 
-            // Auto-focus first item after games are loaded, but not while search bar is active
-            if (sortedGames.isNotEmpty() && !isSearchExpanded && pendingShortcutProductId == null) {
+            // Auto-focus first item after games are loaded, but not while search bar is active,
+            // and not while the user is actively working a header control (e.g. cycling the
+            // streamability filter re-fires this same observer on every state change via
+            // cycleStreamabilityFilter()'s setSortedGames() call — without this check, focus
+            // would jump to the grid on every press instead of staying on the button being
+            // cycled).
+            val headerButtons = setOf(
+                binding.headerFavoritesButton, binding.headerStreamabilityFilterButton,
+                binding.headerSortButton, binding.headerSearchButton, binding.headerRefreshButton
+            )
+            val headerHasFocus = activity?.currentFocus?.let { it in headerButtons } ?: false
+            // Also skip while updateGameStreamability() is confirming a PS5 Library launch's
+            // real streamable/non-streamable outcome — that call re-emits this same LiveData
+            // (so the streamability filter can react immediately) while the clicked tile is
+            // still focused and the allocation dialog is up. Without this check the grid would
+            // silently scroll/focus back to the first tile in the background, so returning from
+            // the stream landed on the top of the list instead of the tile that was launched.
+            if (sortedGames.isNotEmpty() && !isSearchExpanded && !headerHasFocus && !isConfirmingStreamability && pendingShortcutProductId == null) {
                 focusFirstGame()
             }
         })
@@ -1614,7 +1653,12 @@ class CloudPlayFragment : Fragment() {
         // through the same games.observe pipeline that applies the streamability filter —
         // a game confirmed streamable/non-streamable immediately leaves "Not Verified" and
         // shows up under "Streamable"/"Non-streamable" if that filter is currently active.
+        // isConfirmingStreamability brackets the call because that re-emit is synchronous
+        // (LiveData.setValue on the main thread), so games.observe's auto-focus check can
+        // see the flag and skip re-focusing the grid for this specific re-emit.
+        isConfirmingStreamability = true
         viewModel.updateGameStreamableStatus(game.productId, newStatus)
+        isConfirmingStreamability = false
     }
 
     /**
@@ -1628,7 +1672,7 @@ class CloudPlayFragment : Fragment() {
         val message = if (serviceType == "psnow")
             "Please ensure that you have a PS Plus Premium subscription and PS Now streaming is available in your region"
         else
-            "Please ensure that you have a PS Plus Premium subscription, that the game is available for PS Cloud Streaming and PS Cloud streaming is available in your region"
+            "Please ensure that you have a PS Plus Premium subscription, that the game is available for PS Cloud Streaming, that PS Cloud streaming is available in your region and that the PS servers are not currently down"
 
         requireContext().alertDialogBuilder()
             .setTitle("Streaming Unavailable")
@@ -1716,6 +1760,23 @@ class CloudPlayFragment : Fragment() {
                 allocationGameImageView = null
             }, 300)
         }
+    }
+
+    /**
+     * GridLayoutManager that forces instant (non-smooth) scroll when D-pad focus moves to an
+     * off-screen item. The default smooth-scroll behaviour lets multiple fast D-pad presses queue
+     * up, causing the grid to overshoot and leave the focused card off-screen.
+     */
+    private inner class InstantScrollGridLayoutManager(spanCount: Int) :
+        GridLayoutManager(requireContext(), spanCount) {
+
+        override fun requestChildRectangleOnScreen(
+            parent: RecyclerView,
+            child: View,
+            rect: Rect,
+            immediate: Boolean,
+            focusedChildVisible: Boolean
+        ): Boolean = super.requestChildRectangleOnScreen(parent, child, rect, true, focusedChildVisible)
     }
 }
 

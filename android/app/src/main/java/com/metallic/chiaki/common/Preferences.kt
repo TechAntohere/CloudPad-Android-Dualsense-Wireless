@@ -966,4 +966,42 @@ class Preferences(context: Context)
 				.remove(DONATION_STREAM_AUTO_PROMPT_SHOWN_KEY)
 				.apply()
 		}
+
+	// ---------------------------------------------------------------------
+	// DualSense wireless output tuning.
+	//
+	// These are tuning knobs only -- the DualSense feedback stack itself is
+	// always on when a DualSense is connected over Bluetooth. Nothing here
+	// gates whether haptics / triggers / lightbar run.
+	// ---------------------------------------------------------------------
+
+	/** Controller built-in speaker volume, 0..100. */
+	val controllerSpeakerVolumeKey = "controller_speaker_volume"
+	var controllerSpeakerVolumePercent
+		get() = sharedPreferences.getInt(controllerSpeakerVolumeKey, 100)
+		set(value) { sharedPreferences.edit().putInt(controllerSpeakerVolumeKey, value.coerceIn(0, 100)).apply() }
+
+	/** Mirror live system audio to the controller speaker / jack. */
+	val controllerSpeakerLiveAudioKey = "controller_speaker_live_audio"
+	var controllerSpeakerLiveAudio
+		get() = sharedPreferences.getBoolean(controllerSpeakerLiveAudioKey, false)
+		set(value) { sharedPreferences.edit().putBoolean(controllerSpeakerLiveAudioKey, value).apply() }
+
+	/** Route controller audio to the 3.5mm headphone jack instead of the speaker. */
+	val controllerHeadphoneOutputKey = "controller_headphone_output"
+	var controllerHeadphoneOutput
+		get() = sharedPreferences.getBoolean(controllerHeadphoneOutputKey, false)
+		set(value) { sharedPreferences.edit().putBoolean(controllerHeadphoneOutputKey, value).apply() }
+
+	/** Headphone jack volume, 0..100. Independent of [controllerSpeakerVolumePercent]. */
+	val controllerHeadphoneVolumeKey = "controller_headphone_volume"
+	var controllerHeadphoneVolumePercent
+		get() = sharedPreferences.getInt(controllerHeadphoneVolumeKey, 100)
+		set(value) { sharedPreferences.edit().putInt(controllerHeadphoneVolumeKey, value.coerceIn(0, 100)).apply() }
+
+	/** Auto-switch speaker <-> headphone when the jack is plugged / unplugged. */
+	val controllerAutoSwitchOutputKey = "controller_auto_switch_output"
+	var controllerAutoSwitchOutput
+		get() = sharedPreferences.getBoolean(controllerAutoSwitchOutputKey, true)
+		set(value) { sharedPreferences.edit().putBoolean(controllerAutoSwitchOutputKey, value).apply() }
 }

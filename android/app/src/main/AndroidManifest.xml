@@ -8,7 +8,15 @@
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- DualSense wireless (BT HID) feedback stack -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
@@ -117,6 +125,20 @@
             android:theme="@style/LicenseAgreementDialog"
             android:configChanges="keyboard|keyboardHidden|orientation|screenSize"
             android:launchMode="singleTop" />
+
+        <!-- DualSense wireless: captures system audio for the controller
+             speaker / headphone-jack output path. -->
+        <service
+            android:name="com.metallic.chiaki.stream.ControllerSystemAudioService"
+            android:foregroundServiceType="mediaProjection"
+            android:exported="false" />
+
+        <!-- DualSense wireless: keeps the BT HID output-report bridge alive
+             while streaming. -->
+        <service
+            android:name="com.metallic.chiaki.stream.ControllerBtForegroundService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
     </application>
 
 </manifest>

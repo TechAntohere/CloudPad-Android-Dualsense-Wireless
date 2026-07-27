@@ -53,17 +53,6 @@
             app:summary="@string/controller_remap_preference_summary"
             app:icon="@drawable/ic_gamepad" />
 
-        <!-- DualSense diagnostics. Hidden by default, matching Senshi: the
-             wireless feedback stack itself is always on and needs no toggle,
-             this screen only reads firmware/battery/jack state over BT HID. -->
-        <Preference
-            app:key="dualsense_info"
-            app:title="@string/preferences_dualsense_info_title"
-            app:summary="@string/preferences_dualsense_info_summary"
-            app:fragment="com.metallic.chiaki.settings.SettingsDualSenseInfoFragment"
-            app:icon="@drawable/ic_gamepad"
-            app:isPreferenceVisible="false" />
-
         <SwitchPreference
             app:key="@string/preferences_microphone_enabled_key"
             app:title="@string/preferences_microphone_enabled_title"

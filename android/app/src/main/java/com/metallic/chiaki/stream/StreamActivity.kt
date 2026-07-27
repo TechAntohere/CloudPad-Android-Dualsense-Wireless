@@ -61,6 +61,7 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 	}
 
 	private lateinit var viewModel: StreamViewModel
+	private lateinit var controllerFeedbackManager: ControllerFeedbackManager
 	private lateinit var binding: ActivityStreamBinding
 	private lateinit var quickSettingsPanel: QuickSettingsPanel
 	private lateinit var trophyUnlockPopupPresenter: TrophyUnlockPopupPresenter
@@ -118,6 +119,33 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 		})[StreamViewModel::class.java]
 
 		viewModel.input.observe(this)
+
+		// --- DualSense wireless feedback -------------------------------
+		controllerFeedbackManager = ControllerFeedbackManager(this)
+		// The BT HID path owns rumble when a DualSense is present; only fall
+		// back to Android's vibrator API when it isn't.
+		controllerFeedbackManager.allowFallbackRumble = false
+		viewModel.session.rumbleState.observe(this, Observer {
+			controllerFeedbackManager.handleRumble(it)
+		})
+		viewModel.session.hapticsFrameCallback = { data, nativeElapsedRealtimeNs ->
+			controllerFeedbackManager.handleHapticsFrame(data, nativeElapsedRealtimeNs)
+		}
+		viewModel.session.triggerEffectsCallback = {
+			controllerFeedbackManager.handleTriggerEffects(it)
+		}
+		viewModel.session.ledColorCallback = {
+			controllerFeedbackManager.handleLightbarColor(it.red, it.green, it.blue)
+		}
+		viewModel.session.playerIndexCallback = {
+			controllerFeedbackManager.handlePlayerIndex(it)
+		}
+		viewModel.session.hapticIntensityCallback = {
+			controllerFeedbackManager.handleHapticIntensity(it)
+		}
+		viewModel.session.triggerIntensityCallback = {
+			controllerFeedbackManager.handleTriggerIntensity(it)
+		}
 
 		binding = ActivityStreamBinding.inflate(layoutInflater)
 		setContentView(binding.root)
@@ -236,6 +264,7 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 		// exactly when the decoder is (see CasVideoSurfaceView's own doc comment).
 		binding.surfaceView.onResume()
 		viewModel.session.resume()
+		controllerFeedbackManager.onResume()
 	}
 
 	override fun onPause()
@@ -247,6 +276,7 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 			viewModel.session.skipNativeSurfaceCleanup = false
 			binding.surfaceView.onPause()
 			viewModel.session.pause()
+			controllerFeedbackManager.onPause()
 		}
 	}
 
@@ -270,6 +300,15 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 		flushStreamTimeSegment()
 		controlsDisposable.dispose()
 		uiVisibilityHandler.removeCallbacksAndMessages(null)
+		// Drop callbacks before releasing, so a frame already queued on the
+		// haptics thread can't call back into a torn-down manager.
+		viewModel.session.hapticsFrameCallback = null
+		viewModel.session.triggerEffectsCallback = null
+		viewModel.session.ledColorCallback = null
+		viewModel.session.playerIndexCallback = null
+		viewModel.session.hapticIntensityCallback = null
+		viewModel.session.triggerIntensityCallback = null
+		controllerFeedbackManager.release()
 	}
 
 	override fun onConfigurationChanged(newConfig: Configuration)
@@ -445,6 +484,9 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 					connectedAtWallClockMs = System.currentTimeMillis()
 				}
 				trophyUnlockWatcher?.start(lifecycleScope)
+				// Hands the BT bridge the PS5 flag so it knows whether to arm
+				// the DualSense output-report path for this session.
+				controllerFeedbackManager.handleSessionConnected(viewModel.session.connectInfo.ps5)
 			}
 
 			StreamStateConnecting ->
@@ -570,6 +612,7 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 	{
 		if(quickSettingsPanel.isCapturingInput && quickSettingsPanel.handleCaptureKeyEvent(event))
 			return true
+		controllerFeedbackManager.noteInputDevice(event.device)
 		return viewModel.input.dispatchKeyEvent(event) || super.dispatchKeyEvent(event)
 	}
 
@@ -577,6 +620,7 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 	{
 		if(quickSettingsPanel.isCapturingInput && quickSettingsPanel.handleCaptureMotionEvent(event))
 			return true
+		controllerFeedbackManager.noteInputDevice(event.device)
 		return viewModel.input.onGenericMotionEvent(event) || super.onGenericMotionEvent(event)
 	}
 }

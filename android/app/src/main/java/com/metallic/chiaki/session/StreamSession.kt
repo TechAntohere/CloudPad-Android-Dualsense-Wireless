@@ -8,6 +8,10 @@ import android.graphics.SurfaceTexture
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
+import android.os.Process
 import android.util.Log
 import android.view.*
 import androidx.core.content.ContextCompat
@@ -31,6 +35,40 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 
 	private val _state = MutableLiveData<StreamState>(StreamStateIdle)
 	val state: LiveData<StreamState> get() = _state
+
+	// --- DualSense wireless feedback -------------------------------------
+	// Observable state for UI, plus raw callbacks for the BT HID path.
+
+	private val _rumbleState = MutableLiveData<RumbleEvent>(RumbleEvent(0u, 0u))
+	val rumbleState: LiveData<RumbleEvent> get() = _rumbleState
+	private val _ledColorState = MutableLiveData<LedColorEvent>()
+	val ledColorState: LiveData<LedColorEvent> get() = _ledColorState
+	private val _playerIndexState = MutableLiveData<Int>()
+	val playerIndexState: LiveData<Int> get() = _playerIndexState
+	private val _hapticIntensityState = MutableLiveData<Int>()
+	val hapticIntensityState: LiveData<Int> get() = _hapticIntensityState
+	private val _triggerIntensityState = MutableLiveData<Int>()
+	val triggerIntensityState: LiveData<Int> get() = _triggerIntensityState
+	private val _triggerEffectsState = MutableLiveData<TriggerEffectsEvent>()
+	val triggerEffectsState: LiveData<TriggerEffectsEvent> get() = _triggerEffectsState
+
+	var hapticsFrameCallback: ((ByteArray, Long) -> Unit)? = null
+	var ledColorCallback: ((LedColorEvent) -> Unit)? = null
+	var playerIndexCallback: ((Int) -> Unit)? = null
+	var hapticIntensityCallback: ((Int) -> Unit)? = null
+	var triggerIntensityCallback: ((Int) -> Unit)? = null
+	var triggerEffectsCallback: ((TriggerEffectsEvent) -> Unit)? = null
+
+	// Dedicated dispatch threads. eventCallback runs on the native JNI stream
+	// thread; doing a Bluetooth HID write inline there back-pressures stream
+	// decode and visibly freezes the picture. Everything that can reach a BT
+	// send is posted off-thread. Haptics gets its own audio-priority thread so
+	// a slow HID write cannot delay the next frame's dispatch.
+	private val mainHandler = Handler(Looper.getMainLooper())
+	private val btDispatchThread = HandlerThread("ChiakiBtDispatch").apply { start() }
+	private val btHandler = Handler(btDispatchThread.looper)
+	private val hapticsDispatchThread = HandlerThread("ChiakiHapticsDispatch", Process.THREAD_PRIORITY_AUDIO).apply { start() }
+	private val hapticsHandler = Handler(hapticsDispatchThread.looper)
 
 	private var surfaceTexture: SurfaceTexture? = null
 	private var surface: Surface? = null
@@ -238,6 +276,27 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 		shutdown()
 	}
 
+	/**
+	 * Final teardown. Unlike [shutdown] this is not reversible -- it quits the
+	 * DualSense dispatch threads, so it must only be called when the session is
+	 * being discarded for good (see StreamViewModel.onCleared).
+	 */
+	fun release()
+	{
+		Log.i("StreamSession", "release")
+		shutdown()
+		hapticsFrameCallback = null
+		ledColorCallback = null
+		playerIndexCallback = null
+		hapticIntensityCallback = null
+		triggerIntensityCallback = null
+		triggerEffectsCallback = null
+		hapticsHandler.removeCallbacksAndMessages(null)
+		hapticsDispatchThread.quitSafely()
+		btHandler.removeCallbacksAndMessages(null)
+		btDispatchThread.quitSafely()
+	}
+
 	fun resume()
 	{
 		Log.i("StreamSession", "resume: session=${session != null}")
@@ -416,7 +475,42 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 				Log.i("StreamSession", "EVENT: LoginPinRequest pinIncorrect=${event.pinIncorrect}")
 				_state.postValue(StreamStateLoginPinRequest(event.pinIncorrect))
 			}
-			is RumbleEvent -> { }
+			is RumbleEvent -> mainHandler.post {
+				_rumbleState.value = event
+			}
+			is LedColorEvent -> {
+				val cb = ledColorCallback
+				btHandler.post { cb?.invoke(event) }
+				mainHandler.post { _ledColorState.value = event }
+			}
+			is PlayerIndexEvent -> {
+				val cb = playerIndexCallback
+				btHandler.post { cb?.invoke(event.playerIndex) }
+				mainHandler.post { _playerIndexState.value = event.playerIndex }
+			}
+			is HapticIntensityEvent -> {
+				val cb = hapticIntensityCallback
+				btHandler.post { cb?.invoke(event.intensity) }
+				mainHandler.post { _hapticIntensityState.value = event.intensity }
+			}
+			is TriggerIntensityEvent -> {
+				val cb = triggerIntensityCallback
+				btHandler.post { cb?.invoke(event.intensity) }
+				mainHandler.post { _triggerIntensityState.value = event.intensity }
+			}
+			is TriggerEffectsEvent -> {
+				// Must not run inline: handleTriggerEffects takes the writer lock
+				// and does a BT HID send, which would block stream decode.
+				val cb = triggerEffectsCallback
+				btHandler.post { cb?.invoke(event) }
+				mainHandler.post { _triggerEffectsState.value = event }
+			}
+			is HapticsFrameEvent -> {
+				val cb = hapticsFrameCallback
+				val frameData = event.data
+				val nativeElapsedRealtimeNs = event.nativeElapsedRealtimeNs
+				hapticsHandler.post { cb?.invoke(frameData, nativeElapsedRealtimeNs) }
+			}
 			is AutoRegistEvent -> Log.i("StreamSession", "EVENT: AutoRegist host=${event.host.serverNickname}")
 			is HolepunchEvent -> Log.i("StreamSession", "EVENT: Holepunch")
 		}

@@ -524,6 +524,69 @@ data class RumbleEvent(val left: UByte, val right: UByte): Event()
 data class AutoRegistEvent(val host: RegistHost): Event()
 object HolepunchEvent: Event()
 
+// ---------------------------------------------------------------------------
+// DualSense wireless feedback events.
+//
+// The native lib already emits all of these; they were previously dropped on
+// Android because chiaki-jni.c never bridged them. See the DualSense section
+// of chiaki-jni.c -- the JNI signatures registered there must stay in sync
+// with the `eventXxx` upcalls below.
+// ---------------------------------------------------------------------------
+
+/** Controller lightbar colour. chiaki-ng calls this LED_COLOR. */
+data class LedColorEvent(val red: Int, val green: Int, val blue: Int): Event()
+data class PlayerIndexEvent(val playerIndex: Int): Event()
+data class HapticIntensityEvent(val intensity: Int): Event()
+data class TriggerIntensityEvent(val intensity: Int): Event()
+
+/** Adaptive trigger effect descriptors, 10 bytes per trigger. */
+data class TriggerEffectsEvent(
+	val leftType: Int,
+	val leftData: ByteArray,
+	val rightType: Int,
+	val rightData: ByteArray
+): Event()
+{
+	override fun equals(other: Any?): Boolean
+	{
+		if(this === other) return true
+		if(other !is TriggerEffectsEvent) return false
+		return leftType == other.leftType
+				&& rightType == other.rightType
+				&& leftData.contentEquals(other.leftData)
+				&& rightData.contentEquals(other.rightData)
+	}
+
+	override fun hashCode(): Int
+	{
+		var result = leftType
+		result = 31 * result + leftData.contentHashCode()
+		result = 31 * result + rightType
+		result = 31 * result + rightData.contentHashCode()
+		return result
+	}
+}
+
+/**
+ * One frame of the raw DualSense haptics audio lane.
+ *
+ * [nativeElapsedRealtimeNs] is CLOCK_BOOTTIME as sampled on the native thread,
+ * matching SystemClock.elapsedRealtimeNanos(). It is captured natively because
+ * the hop to the JVM is enough to smear the timing the BT report scheduler
+ * depends on.
+ */
+data class HapticsFrameEvent(val data: ByteArray, val nativeElapsedRealtimeNs: Long): Event()
+{
+	override fun equals(other: Any?): Boolean
+	{
+		if(this === other) return true
+		if(other !is HapticsFrameEvent) return false
+		return nativeElapsedRealtimeNs == other.nativeElapsedRealtimeNs && data.contentEquals(other.data)
+	}
+
+	override fun hashCode(): Int = 31 * data.contentHashCode() + nativeElapsedRealtimeNs.hashCode()
+}
+
 class CreateError(val errorCode: ErrorCode): Exception("Failed to create a native object: $errorCode")
 
 class Session(connectInfo: ConnectInfo, logFile: String?, logVerbose: Boolean)
@@ -591,6 +654,40 @@ class Session(connectInfo: ConnectInfo, logFile: String?, logVerbose: Boolean)
 	private fun eventHolepunch()
 	{
 		event(HolepunchEvent)
+	}
+
+	// --- DualSense wireless feedback upcalls -------------------------------
+	// Called from native. Names and signatures must match the GetMethodID
+	// calls in chiaki-jni.c exactly, or they resolve to null and crash.
+
+	private fun eventLedColor(red: Int, green: Int, blue: Int)
+	{
+		event(LedColorEvent(red, green, blue))
+	}
+
+	private fun eventPlayerIndex(playerIndex: Int)
+	{
+		event(PlayerIndexEvent(playerIndex))
+	}
+
+	private fun eventHapticIntensity(intensity: Int)
+	{
+		event(HapticIntensityEvent(intensity))
+	}
+
+	private fun eventTriggerIntensity(intensity: Int)
+	{
+		event(TriggerIntensityEvent(intensity))
+	}
+
+	private fun eventTriggerEffects(leftType: Int, leftData: ByteArray, rightType: Int, rightData: ByteArray)
+	{
+		event(TriggerEffectsEvent(leftType, leftData, rightType, rightData))
+	}
+
+	private fun eventHapticsFrame(data: ByteArray, nativeElapsedRealtimeNs: Long)
+	{
+		event(HapticsFrameEvent(data, nativeElapsedRealtimeNs))
 	}
 
 	fun setSurface(surface: Surface?)

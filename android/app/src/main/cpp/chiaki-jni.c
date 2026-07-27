@@ -16,6 +16,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <linux/in.h>
@@ -210,6 +211,16 @@ typedef struct android_chiaki_session_t
 	jmethodID java_session_event_rumble_meth;
 	jmethodID java_session_event_regist_meth;
 	jmethodID java_session_event_holepunch_meth;
+	// DualSense wireless feedback: the lib already produces all of these,
+	// they were simply never bridged to Kotlin on Android.
+	jmethodID java_session_event_led_color_meth;
+	jmethodID java_session_event_player_index_meth;
+	jmethodID java_session_event_haptic_intensity_meth;
+	jmethodID java_session_event_trigger_intensity_meth;
+	jmethodID java_session_event_trigger_effects_meth;
+	jmethodID java_session_event_haptics_frame_meth;
+	uint32_t haptics_frames_received;
+	uint32_t haptics_frames_dropped_small;
 	// Cached class refs for CHIAKI_EVENT_REGIST (FindClass doesn't work from native threads)
 	jclass java_target_class;
 	jmethodID java_target_from_value;
@@ -297,6 +308,84 @@ static bool android_chiaki_video_sample_with_metrics(
 	);
 }
 
+// ---------------------------------------------------------------------------
+// DualSense wireless: raw haptics lane.
+//
+// The PS5 streams DualSense haptics as a second Opus audio lane. chiaki's
+// audioreceiver already demuxes it on packet->is_haptics and hands the frames
+// to session->haptics_sink -- that path is live in this tree and is consumed by
+// the Qt and Switch frontends. It was simply never bridged to Kotlin, so on
+// Android the frames were decoded and dropped on the floor.
+//
+// We attach a sink and forward each frame up to StreamSession, which feeds the
+// DualSense BT HID output-report builder.
+// ---------------------------------------------------------------------------
+
+/** CLOCK_BOOTTIME in ns, to match Android's SystemClock.elapsedRealtimeNanos(). */
+static int64_t android_chiaki_elapsed_realtime_nanos(void)
+{
+	struct timespec ts;
+	if(clock_gettime(CLOCK_BOOTTIME, &ts) != 0)
+		return 0;
+	return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+
+static void android_chiaki_emit_haptics_frame(JNIEnv *env, AndroidChiakiSession *session,
+		const uint8_t *buf, size_t buf_size, int64_t native_elapsed_realtime_ns)
+{
+	jbyteArray data = jnibytearray_create(env, buf, buf_size);
+	E->CallVoidMethod(env, session->java_session,
+					  session->java_session_event_haptics_frame_meth,
+					  data,
+					  (jlong)native_elapsed_realtime_ns);
+	E->DeleteLocalRef(env, data);
+}
+
+static void android_chiaki_haptics_header(ChiakiAudioHeader *header, void *user)
+{
+	AndroidChiakiSession *session = user;
+	if(!session || !header)
+		return;
+	CHIAKI_LOGI(session->log, "JNI haptics lane header: channels=%u rate=%u",
+		(unsigned int)header->channels, (unsigned int)header->rate);
+}
+
+static void android_chiaki_haptics_frame(uint8_t *buf, size_t buf_size, void *user)
+{
+	AndroidChiakiSession *session = user;
+	int64_t native_elapsed_realtime_ns = android_chiaki_elapsed_realtime_nanos();
+	if(!buf || !buf_size)
+		return;
+
+	session->haptics_frames_received++;
+	// Frames under 4 bytes carry no usable waveform and confuse the report
+	// builder downstream; drop them but keep a counter so it is visible in logs.
+	if(buf_size < 4)
+	{
+		session->haptics_frames_dropped_small++;
+		if(session->haptics_frames_dropped_small <= 8 || session->haptics_frames_dropped_small % 64 == 0)
+		{
+			CHIAKI_LOGW(session->log, "JNI dropping tiny haptics frame #%u with size=%llu",
+				(unsigned int)session->haptics_frames_dropped_small,
+				(unsigned long long)buf_size);
+		}
+		return;
+	}
+
+	if(session->haptics_frames_received <= 8 || session->haptics_frames_received % 256 == 0)
+	{
+		CHIAKI_LOGI(session->log, "JNI live haptics frame #%u size=%llu",
+			(unsigned int)session->haptics_frames_received,
+			(unsigned long long)buf_size);
+	}
+
+	JNIEnv *env = attach_thread_jni();
+	if(!env)
+		return;
+	android_chiaki_emit_haptics_frame(env, session, buf, buf_size, native_elapsed_realtime_ns);
+	(*global_vm)->DetachCurrentThread(global_vm);
+}
+
 static void android_chiaki_event_cb(ChiakiEvent *event, void *user)
 {
 	AndroidChiakiSession *session = user;
@@ -334,6 +423,44 @@ static void android_chiaki_event_cb(ChiakiEvent *event, void *user)
 							  session->java_session_event_rumble_meth,
 							  (jint)event->rumble.left,
 							  (jint)event->rumble.right);
+			break;
+		case CHIAKI_EVENT_TRIGGER_EFFECTS:
+		{
+			jbyteArray left_data = jnibytearray_create(env, event->trigger_effects.left, sizeof(event->trigger_effects.left));
+			jbyteArray right_data = jnibytearray_create(env, event->trigger_effects.right, sizeof(event->trigger_effects.right));
+			E->CallVoidMethod(env, session->java_session,
+							  session->java_session_event_trigger_effects_meth,
+							  (jint)event->trigger_effects.type_left,
+							  left_data,
+							  (jint)event->trigger_effects.type_right,
+							  right_data);
+			E->DeleteLocalRef(env, left_data);
+			E->DeleteLocalRef(env, right_data);
+			break;
+		}
+		// chiaki-ng calls this LED_COLOR and carries it as a raw 3-byte array,
+		// where chiaki mainline used a lightbar struct. Same payload.
+		case CHIAKI_EVENT_LED_COLOR:
+			E->CallVoidMethod(env, session->java_session,
+							  session->java_session_event_led_color_meth,
+							  (jint)event->led_state[0],
+							  (jint)event->led_state[1],
+							  (jint)event->led_state[2]);
+			break;
+		case CHIAKI_EVENT_PLAYER_INDEX:
+			E->CallVoidMethod(env, session->java_session,
+							  session->java_session_event_player_index_meth,
+							  (jint)event->player_index);
+			break;
+		case CHIAKI_EVENT_HAPTIC_INTENSITY:
+			E->CallVoidMethod(env, session->java_session,
+							  session->java_session_event_haptic_intensity_meth,
+							  (jint)event->intensity);
+			break;
+		case CHIAKI_EVENT_TRIGGER_INTENSITY:
+			E->CallVoidMethod(env, session->java_session,
+							  session->java_session_event_trigger_intensity_meth,
+							  (jint)event->intensity);
 			break;
 		case CHIAKI_EVENT_REGIST:
 		{
@@ -490,6 +617,11 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 
 	connect_info.video_profile_auto_downgrade = true;
 
+	// DualSense feedback is a PS5-only feature. connect_info is zero-initialised
+	// and this was never assigned on Android, so the console was never asked to
+	// send the haptics lane or trigger-effect events at all.
+	connect_info.enable_dualsense = ps5;
+
 	// Auto-registration field (for PSN remote registration)
 	jboolean auto_regist = E->GetBooleanField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "autoRegist", "Z"));
 	connect_info.auto_regist = auto_regist;
@@ -503,6 +635,8 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 		if(strcmp(service_type_str, "pscloud") == 0)
 		{
 			connect_info.service_type = CHIAKI_SERVICE_TYPE_PSCLOUD;
+			// Cloud sessions are always PS5-class regardless of the ps5 flag.
+			connect_info.enable_dualsense = true;
 			CHIAKI_LOGI(log, "[ANDROID JNI] Set service_type to PSCLOUD (%d)", CHIAKI_SERVICE_TYPE_PSCLOUD);
 		}
 		else if(strcmp(service_type_str, "psnow") == 0)
@@ -681,6 +815,14 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 	session->java_session_event_regist_meth = E->GetMethodID(env, session->java_session_class, "eventRegist", "(L"BASE_PACKAGE"/RegistHost;)V");
 	session->java_session_event_holepunch_meth = E->GetMethodID(env, session->java_session_class, "eventHolepunch", "()V");
 
+	// DualSense wireless feedback bridge.
+	session->java_session_event_led_color_meth = E->GetMethodID(env, session->java_session_class, "eventLedColor", "(III)V");
+	session->java_session_event_player_index_meth = E->GetMethodID(env, session->java_session_class, "eventPlayerIndex", "(I)V");
+	session->java_session_event_haptic_intensity_meth = E->GetMethodID(env, session->java_session_class, "eventHapticIntensity", "(I)V");
+	session->java_session_event_trigger_intensity_meth = E->GetMethodID(env, session->java_session_class, "eventTriggerIntensity", "(I)V");
+	session->java_session_event_trigger_effects_meth = E->GetMethodID(env, session->java_session_class, "eventTriggerEffects", "(I[BI[B)V");
+	session->java_session_event_haptics_frame_meth = E->GetMethodID(env, session->java_session_class, "eventHapticsFrame", "([BJ)V");
+
 	// Cache class refs for CHIAKI_EVENT_REGIST (FindClass won't work from native threads)
 	session->java_target_class = E->NewGlobalRef(env, E->FindClass(env, BASE_PACKAGE"/Target"));
 	session->java_target_from_value = E->GetStaticMethodID(env, session->java_target_class, "fromValue", "(I)L"BASE_PACKAGE"/Target;");
@@ -732,6 +874,18 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 	else
 		android_chiaki_audio_decoder_get_sink(&session->audio_decoder, &audio_sink);
 	chiaki_session_set_audio_sink(&session->session, &audio_sink);
+
+	// Attach the raw haptics lane. Gated on enable_dualsense so non-DualSense
+	// sessions don't pay for frames nothing will consume.
+	if(connect_info.enable_dualsense)
+	{
+		ChiakiAudioSink haptics_sink = { 0 };
+		haptics_sink.user = session;
+		haptics_sink.header_cb = android_chiaki_haptics_header;
+		haptics_sink.frame_cb = android_chiaki_haptics_frame;
+		chiaki_session_set_haptics_sink(&session->session, &haptics_sink);
+		CHIAKI_LOGI(log, "JNI attached raw haptics sink");
+	}
 
 beach:
 	if(!session && log)

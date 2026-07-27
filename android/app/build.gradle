@@ -214,6 +214,11 @@ dependencies {
     implementation 'io.coil-kt:coil:2.4.0'
     implementation 'androidx.security:security-crypto:1.1.0-alpha06'
 
+    // DualSense wireless: DualSenseBtHidBridge reaches the hidden
+    // BluetoothHidHost / InputManager APIs needed to send HID output reports
+    // to the controller. Pinned rather than '+' so builds stay reproducible.
+    implementation 'org.lsposed.hiddenapibypass:hiddenapibypass:4.3'
+
     // Play In-App Review (uses existing [Preferences.totalStreamTimeMs] from stream sessions; no extra timers)
     implementation 'com.google.android.play:review-ktx:2.0.2'
     // Play Billing 8.x Java API (no billing-ktx: that artifact targets Kotlin 2.2+ and forces a full Kotlin/Room/Moshi upgrade chain)

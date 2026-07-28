@@ -173,7 +173,10 @@ class StreamViewModel(
 	override fun onCleared() {
 		super.onCleared()
 		stopMetricsPolling()
-		session.shutdown()
+		// release() rather than shutdown(): also quits the DualSense BT and
+		// haptics dispatch threads, which shutdown() deliberately leaves alive
+		// so a paused session can resume.
+		session.release()
 	}
 
 	fun setOnScreenControlsEnabled(enabled: Boolean) {

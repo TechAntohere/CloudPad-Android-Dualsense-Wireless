@@ -1,7 +1,10 @@
 
 cmake_minimum_required(VERSION 3.13)
 
-set(CMAKE_CXX_STANDARD 14)
+# oboe (>= 1.9) uses nested namespace definitions, which are C++17. NDK r28
+# promotes -Wc++17-extensions to an error, so C++14 here fails the build.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Fix for 16 KB page size compatibility (required for Android devices with 16 KB pages)
 # With NDK r28+ and ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON set in build.gradle,

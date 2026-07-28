@@ -74,6 +74,12 @@ class ControllerFeedbackManager(private val context: Context)
 		get() = btStreamFeedback.controllerJackStateCallback
 		set(value) { btStreamFeedback.controllerJackStateCallback = value }
 
+	/** Controller battery 0..100, or null if not known yet. See [DualSenseBtStreamFeedback.controllerBatteryPercent]. */
+	val controllerBatteryPercent: Int? get() = btStreamFeedback.controllerBatteryPercent
+
+	/** True once the BT feedback path has actually reached a DualSense. */
+	val isBluetoothControllerActive: Boolean get() = isBluetoothControllerOutputAvailable()
+
 	fun onResume()
 	{
 		btStreamFeedback.onResume()

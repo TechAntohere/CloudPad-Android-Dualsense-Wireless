@@ -590,4 +590,14 @@
     <string name="preferences_controller_headphone_volume_summary">Volume for the 3.5 mm headphone jack output</string>
     <string name="preferences_controller_auto_switch_output_title">Auto DualSense Jack Audio</string>
     <string name="preferences_controller_auto_switch_output_summary">During Remote Play, route game audio to the DualSense 3.5 mm jack when headphones are plugged into the controller, then switch back to Android audio when unplugged</string>
+
+    <!-- ==== DualSense quick settings ==== -->
+    <string name="quick_settings_dualsense">DualSense</string>
+    <string name="quick_settings_controller_battery">Controller battery</string>
+    <string name="quick_settings_controller_jack">Headphone jack</string>
+    <string name="quick_settings_controller_jack_plugged">Plugged</string>
+    <string name="quick_settings_controller_jack_unplugged">Unplugged</string>
+    <string name="quick_settings_headphone_volume">Headphone volume: %1$d%%</string>
+    <string name="quick_settings_value_unknown">--</string>
+    <string name="quick_settings_headphone_volume_short">%1$d%%</string>
 </resources>

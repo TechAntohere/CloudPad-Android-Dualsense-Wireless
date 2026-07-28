@@ -401,6 +401,19 @@ class DualSenseBtStreamFeedback(context: Context)
     @Volatile private var jackPollerRunning = false
     @Volatile var controllerJackStateCallback: ((Boolean) -> Unit)? = null
 
+    /**
+     * Last battery level read from the controller, 0..100, or null if unknown.
+     * Populated by the jack poller from the same input report it already
+     * requests -- reading this costs no additional Bluetooth traffic, but it is
+     * only as fresh as the poll interval.
+     */
+    @Volatile var controllerBatteryPercent: Int? = null
+        private set
+
+    /** Raw power state string from the same report, e.g. "discharging". */
+    @Volatile var controllerPowerState: String? = null
+        private set
+
     fun onResume()
     {
         if(!isSupported() || !hasBluetoothPermission())
@@ -1122,6 +1135,12 @@ class DualSenseBtStreamFeedback(context: Context)
                             val status = DualSenseInfoParser.parseInputStatus(result.report)
                             if(status != null)
                             {
+                                // Battery rides along on the report the jack poller
+                                // already requests, so surfacing it costs no extra
+                                // BT traffic. Null while unparseable/unknown.
+                                controllerBatteryPercent =
+                                    status.batteryPercent.removeSuffix("%").toIntOrNull()?.coerceIn(0, 100)
+                                controllerPowerState = status.powerState
                                 val plugged = status.headphonesPlugged
                                 if(plugged != lastPlugged)
                                 {

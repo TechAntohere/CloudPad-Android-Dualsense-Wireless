@@ -131,4 +131,47 @@
          proved unreliable to animate/composite correctly even with visibility and hardware-
          layer workarounds. A separate window is composited above the activity deterministically. -->
 
+    <!-- DualSense headphone volume HUD. Shown by StreamActivity only while the
+         controller's 3.5mm jack is active, when the hardware volume keys are
+         retargeted from phone volume to the controller's headphone output.
+         Non-interactive: it is feedback for the key presses, not a control. -->
+    <FrameLayout
+        android:id="@+id/headphoneVolumeOverlay"
+        android:layout_width="68dp"
+        android:layout_height="220dp"
+        android:layout_gravity="center_vertical|end"
+        android:layout_marginEnd="24dp"
+        android:alpha="0"
+        android:background="@drawable/bg_trophy_unlock_popup"
+        android:clickable="false"
+        android:focusable="false"
+        android:padding="10dp"
+        android:visibility="gone"
+        tools:alpha="1"
+        tools:visibility="visible">
+
+        <SeekBar
+            android:id="@+id/headphoneVolumeSeekBar"
+            android:layout_width="180dp"
+            android:layout_height="48dp"
+            android:layout_gravity="center"
+            android:max="100"
+            android:progress="100"
+            android:progressTint="?attr/pyluxAccent"
+            android:progressBackgroundTint="@android:color/white"
+            android:thumbTint="?attr/pyluxAccent"
+            android:rotation="-90" />
+
+        <TextView
+            android:id="@+id/headphoneVolumeTextView"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|center_horizontal"
+            android:gravity="center"
+            android:textColor="@android:color/white"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            tools:text="80%" />
+    </FrameLayout>
+
 </FrameLayout>

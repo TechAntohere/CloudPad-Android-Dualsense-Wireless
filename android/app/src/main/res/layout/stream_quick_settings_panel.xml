@@ -289,6 +289,19 @@
             <include layout="@layout/item_quick_settings_switch" android:id="@+id/quickSettingsCasRow" />
             <include layout="@layout/item_quick_settings_seekbar" android:id="@+id/quickSettingsCasSeekBarRow" />
 
+            <!-- DualSense wireless. The whole section is hidden unless a
+                 DualSense is actually connected over BT, and the headphone
+                 volume row is hidden further unless the jack is plugged, since
+                 that control does nothing while audio routes to the speaker. -->
+            <TextView
+                android:id="@+id/quickSettingsDualSenseSectionLabel"
+                style="@style/QuickSettingsSectionLabel"
+                android:text="@string/quick_settings_dualsense" />
+
+            <include layout="@layout/item_quick_settings_readout" android:id="@+id/quickSettingsControllerBatteryRow" />
+            <include layout="@layout/item_quick_settings_readout" android:id="@+id/quickSettingsControllerJackRow" />
+            <include layout="@layout/item_quick_settings_seekbar" android:id="@+id/quickSettingsHeadphoneVolumeRow" />
+
         </LinearLayout>
 
     </ScrollView>

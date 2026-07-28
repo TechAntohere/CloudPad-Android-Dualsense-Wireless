@@ -6,6 +6,8 @@ import androidx.appcompat.app.AlertDialog
 import com.metallic.chiaki.common.ext.alertDialogBuilder
 import com.metallic.chiaki.common.ext.isTv
 import android.Manifest
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
 import android.app.PictureInPictureParams
 import android.content.res.Configuration
 import android.graphics.Matrix
@@ -59,6 +61,10 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 		 *  that header is hidden entirely. */
 		const val EXTRA_GAME_IMAGE_URL = "game_image_url"
 		private const val HIDE_UI_TIMEOUT_MS = 4000L
+		/** How long the DualSense headphone volume HUD stays up after the last key press. */
+		private const val HIDE_HEADPHONE_VOLUME_TIMEOUT_MS = 1500L
+		/** Percentage points per volume-key press, matching Senshi. */
+		private const val HEADPHONE_VOLUME_STEP = 5
 		/** How long to wait before the silent retry for CHIAKI_QUIT_REASON_SESSION_REQUEST_RP_IN_USE
 		 *  (see [autoRetriedFirstConnect]) — confirmed on-device that retrying immediately after that
 		 *  quit reason reliably fails again with the same reason, since it's the console itself, not
@@ -68,6 +74,29 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 
 	private lateinit var viewModel: StreamViewModel
 	private lateinit var controllerFeedbackManager: ControllerFeedbackManager
+
+	/**
+	 * True while the DualSense's 3.5mm jack is plugged and stream audio is being
+	 * routed to it. Only then do the hardware volume keys get retargeted from
+	 * phone volume to the controller's headphone output -- with the jack out,
+	 * that control does nothing, so the keys are left alone.
+	 */
+	@Volatile private var dualSenseJackAudioActive = false
+	/** Guards against the HUD seek bar's own listener re-entering the setter. */
+	private var updatingHeadphoneVolumeSeekBar = false
+	private val hideHeadphoneVolumeRunnable = Runnable { hideHeadphoneVolumeOverlay() }
+
+	/** True if a DualSense is reachable over BT right now — used by QuickSettingsPanel
+	 *  to decide whether to show its DualSense section at all. */
+	val isDualSenseConnected: Boolean
+		get() = this::controllerFeedbackManager.isInitialized && controllerFeedbackManager.isBluetoothControllerActive
+
+	/** Controller battery 0..100, or null if not yet known. */
+	val dualSenseBatteryPercent: Int?
+		get() = if(this::controllerFeedbackManager.isInitialized) controllerFeedbackManager.controllerBatteryPercent else null
+
+	/** Whether the controller's headphone jack is currently plugged. */
+	val isDualSenseJackPlugged: Boolean get() = dualSenseJackAudioActive
 	private lateinit var binding: ActivityStreamBinding
 	private lateinit var quickSettingsPanel: QuickSettingsPanel
 	private lateinit var trophyUnlockPopupPresenter: TrophyUnlockPopupPresenter
@@ -182,6 +211,16 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 		}
 		viewModel.session.triggerIntensityCallback = {
 			controllerFeedbackManager.handleTriggerIntensity(it)
+		}
+		// Fired from the BT jack poller thread, so hop to the main thread before
+		// touching the HUD or the panel.
+		controllerFeedbackManager.controllerJackStateCallback = { plugged ->
+			runOnUiThread {
+				dualSenseJackAudioActive = plugged
+				if(!plugged)
+					hideHeadphoneVolumeOverlay()
+				quickSettingsPanel.refreshDualSenseRows()
+			}
 		}
 
 		binding = ActivityStreamBinding.inflate(layoutInflater)
@@ -491,6 +530,62 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 
 	private val hideSystemUIRunnable = Runnable { hideSystemUI() }
 
+	// --- DualSense headphone volume -------------------------------------------
+
+	private fun adjustDualSenseHeadphoneVolume(raise: Boolean)
+	{
+		val current = viewModel.preferences.controllerHeadphoneVolumePercent
+		val next = (current + if(raise) HEADPHONE_VOLUME_STEP else -HEADPHONE_VOLUME_STEP).coerceIn(0, 100)
+		if(next == current)
+		{
+			// Already at an end stop: still re-show the HUD so the key press
+			// doesn't feel dead.
+			showHeadphoneVolumeOverlay(current)
+			return
+		}
+		setDualSenseHeadphoneVolume(next)
+		showHeadphoneVolumeOverlay(next)
+	}
+
+	/** Single place that writes headphone volume, so the pref, the live BT report
+	 *  builder and the Quick Settings slider can never disagree. */
+	fun setDualSenseHeadphoneVolume(volumePercent: Int)
+	{
+		val next = volumePercent.coerceIn(0, 100)
+		viewModel.preferences.controllerHeadphoneVolumePercent = next
+		if(this::controllerFeedbackManager.isInitialized)
+			controllerFeedbackManager.updateHeadphoneVolume(next)
+	}
+
+	private fun showHeadphoneVolumeOverlay(volumePercent: Int)
+	{
+		val clamped = volumePercent.coerceIn(0, 100)
+		updatingHeadphoneVolumeSeekBar = true
+		binding.headphoneVolumeSeekBar.progress = clamped
+		updatingHeadphoneVolumeSeekBar = false
+		binding.headphoneVolumeTextView.text = getString(R.string.quick_settings_headphone_volume_short, clamped)
+		binding.headphoneVolumeOverlay.isVisible = true
+		binding.headphoneVolumeOverlay.animate()
+			.alpha(1.0f)
+			.setListener(null)
+		uiVisibilityHandler.removeCallbacks(hideHeadphoneVolumeRunnable)
+		uiVisibilityHandler.postDelayed(hideHeadphoneVolumeRunnable, HIDE_HEADPHONE_VOLUME_TIMEOUT_MS)
+	}
+
+	private fun hideHeadphoneVolumeOverlay()
+	{
+		uiVisibilityHandler.removeCallbacks(hideHeadphoneVolumeRunnable)
+		binding.headphoneVolumeOverlay.animate()
+			.alpha(0.0f)
+			.setListener(object: AnimatorListenerAdapter()
+			{
+				override fun onAnimationEnd(animation: Animator)
+				{
+					binding.headphoneVolumeOverlay.isGone = true
+				}
+			})
+	}
+
 	override fun onSystemUiVisibilityChange(visibility: Int)
 	{
 		// If the system bars become visible (e.g. an edge swipe in immersive mode),
@@ -744,6 +839,21 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 	{
 		if(quickSettingsPanel.isCapturingInput && quickSettingsPanel.handleCaptureKeyEvent(event))
 			return true
+		// While the controller's jack is in use, the hardware volume keys drive
+		// the DualSense headphone output rather than phone volume. Consumed in
+		// both ACTION_DOWN and ACTION_UP so the system volume UI never appears.
+		when(event.keyCode)
+		{
+			KeyEvent.KEYCODE_VOLUME_UP,
+			KeyEvent.KEYCODE_VOLUME_DOWN -> {
+				if(dualSenseJackAudioActive)
+				{
+					if(event.action == KeyEvent.ACTION_DOWN)
+						adjustDualSenseHeadphoneVolume(event.keyCode == KeyEvent.KEYCODE_VOLUME_UP)
+					return true
+				}
+			}
+		}
 		controllerFeedbackManager.noteInputDevice(event.device)
 		return viewModel.input.dispatchKeyEvent(event) || super.dispatchKeyEvent(event)
 	}

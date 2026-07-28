@@ -533,6 +533,31 @@ class QuickSettingsPanel(
 			override fun onStopTrackingTouch(seekBar: SeekBar) {}
 		})
 
+		// DualSense rows. Battery and jack are read-only readouts fed by the BT
+		// jack poller; the volume slider writes through StreamActivity so the
+		// pref, the live report builder and the volume-key HUD stay in sync.
+		panel.quickSettingsControllerBatteryRow.quickSettingsReadoutLabel.text =
+			activity.getString(R.string.quick_settings_controller_battery)
+		panel.quickSettingsControllerJackRow.quickSettingsReadoutLabel.text =
+			activity.getString(R.string.quick_settings_controller_jack)
+		panel.quickSettingsHeadphoneVolumeRow.quickSettingsSeekBar.max = 100
+		panel.quickSettingsHeadphoneVolumeRow.quickSettingsSeekBar.keyProgressIncrement = 5
+		panel.quickSettingsHeadphoneVolumeRow.quickSettingsSeekBar.progress =
+			preferences.controllerHeadphoneVolumePercent
+		updateHeadphoneVolumeLabel(preferences.controllerHeadphoneVolumePercent)
+		panel.quickSettingsHeadphoneVolumeRow.quickSettingsSeekBar.setOnSeekBarChangeListener(object: SeekBar.OnSeekBarChangeListener
+		{
+			override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean)
+			{
+				updateHeadphoneVolumeLabel(progress)
+				if(fromUser)
+					activity.setDualSenseHeadphoneVolume(progress)
+			}
+			override fun onStartTrackingTouch(seekBar: SeekBar) {}
+			override fun onStopTrackingTouch(seekBar: SeekBar) {}
+		})
+		refreshDualSenseRows()
+
 		// Window Size applies immediately too, as soon as a new option is checked.
 		panel.quickSettingsDisplayModeToggle.addOnButtonCheckedListener { _, checkedId, isChecked ->
 			if(!isChecked) return@addOnButtonCheckedListener
@@ -1261,6 +1286,52 @@ class QuickSettingsPanel(
 			activity.getString(R.string.quick_settings_cas_sharpening_level, value)
 	}
 
+	private fun updateHeadphoneVolumeLabel(value: Int)
+	{
+		panel.quickSettingsHeadphoneVolumeRow.quickSettingsSeekBarLabel.text =
+			activity.getString(R.string.quick_settings_headphone_volume, value)
+	}
+
+	/**
+	 * Re-reads the DualSense state and shows/hides the section accordingly.
+	 *
+	 * Called on open and whenever the jack state changes. The whole section is
+	 * hidden when no DualSense is reachable over BT, and the volume slider is
+	 * hidden further while the jack is unplugged, since headphone volume does
+	 * nothing when audio is routed to the built-in speaker.
+	 *
+	 * Safe to call from any point after construction; must be on the main thread.
+	 */
+	fun refreshDualSenseRows()
+	{
+		val connected = activity.isDualSenseConnected
+		val sectionVisibility = if(connected) View.VISIBLE else View.GONE
+		panel.quickSettingsDualSenseSectionLabel.visibility = sectionVisibility
+		panel.quickSettingsControllerBatteryRow.root.visibility = sectionVisibility
+		panel.quickSettingsControllerJackRow.root.visibility = sectionVisibility
+
+		val jackPlugged = activity.isDualSenseJackPlugged
+		panel.quickSettingsHeadphoneVolumeRow.root.visibility =
+			if(connected && jackPlugged) View.VISIBLE else View.GONE
+
+		if(!connected)
+			return
+
+		val battery = activity.dualSenseBatteryPercent
+		panel.quickSettingsControllerBatteryRow.quickSettingsReadoutValue.text =
+			if(battery != null) activity.getString(R.string.quick_settings_headphone_volume_short, battery)
+			else activity.getString(R.string.quick_settings_value_unknown)
+		panel.quickSettingsControllerJackRow.quickSettingsReadoutValue.text = activity.getString(
+			if(jackPlugged) R.string.quick_settings_controller_jack_plugged
+			else R.string.quick_settings_controller_jack_unplugged
+		)
+
+		// The volume keys can move this behind the panel's back.
+		val volume = preferences.controllerHeadphoneVolumePercent
+		if(panel.quickSettingsHeadphoneVolumeRow.quickSettingsSeekBar.progress != volume)
+			panel.quickSettingsHeadphoneVolumeRow.quickSettingsSeekBar.progress = volume
+	}
+
 	private fun addSeekBarRow(
 		container: LinearLayout,
 		summaryRes: Int,
@@ -1319,6 +1390,9 @@ class QuickSettingsPanel(
 		// Re-sync every switch/toggle to the current live value each time the panel opens —
 		// state can change elsewhere while it's closed (e.g. PiP forces On-Screen Controls
 		// and Touchpad Only off), so the panel must not show stale state from last time.
+		// Same reasoning for the DualSense rows: battery drifts and the jack can be
+		// plugged/unplugged while the panel is closed.
+		refreshDualSenseRows()
 		panel.quickSettingsStatsRow.quickSettingsRowSwitch.isChecked = viewModel.showPerformanceOverlay.value ?: false
 		panel.quickSettingsOscRow.quickSettingsRowSwitch.isChecked = viewModel.onScreenControlsEnabled.value ?: false
 		panel.quickSettingsTouchpadRow.quickSettingsRowSwitch.isChecked = viewModel.touchpadOnlyEnabled.value ?: false

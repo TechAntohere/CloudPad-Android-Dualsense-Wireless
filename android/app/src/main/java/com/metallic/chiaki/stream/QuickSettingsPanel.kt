@@ -554,7 +554,13 @@ class QuickSettingsPanel(
 					activity.setDualSenseHeadphoneVolume(progress)
 			}
 			override fun onStartTrackingTouch(seekBar: SeekBar) {}
-			override fun onStopTrackingTouch(seekBar: SeekBar) {}
+			// Play a short preview through the controller once the user lets go,
+			// so the new level can actually be heard. Not on every progress tick,
+			// which would queue a preview per pixel of drag.
+			override fun onStopTrackingTouch(seekBar: SeekBar)
+			{
+				activity.playDualSenseVolumePreview(seekBar.progress)
+			}
 		})
 		refreshDualSenseRows()
 

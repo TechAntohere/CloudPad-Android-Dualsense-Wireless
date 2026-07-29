@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.PowerManager
 import android.os.Process
 import android.os.SystemClock
+import android.util.Log
 import androidx.core.content.ContextCompat
 import com.metallic.chiaki.lib.TriggerEffectsEvent
 import com.metallic.chiaki.settings.DualSenseBtAudioHapticsBuilder
@@ -460,9 +461,11 @@ class DualSenseBtStreamFeedback(context: Context)
             ensureWriterStartedLocked()
             writerLock.notifyAll()
         }
-        // Preload savannah packets (async, so onResume returns quickly)
-        if(speakerPreviewPackets == null)
-            Thread { speakerPreviewPackets = DualSenseBtSpeakerAudio.loadDualFramePackets(appContext) }.start()
+        // Preview packets are now loaded lazily on the first feedPreviewTone()
+        // call. This used to spawn a bare Thread on every single stream start to
+        // decode a bundled demo clip that only the volume preview ever reads --
+        // and with no exception handler on that thread, a missing asset took the
+        // whole process down mid-stream.
         // Start live speaker streaming thread
         startSpeakerThread()
         startJackPoller()
@@ -1060,6 +1063,25 @@ class DualSenseBtStreamFeedback(context: Context)
     {
         if(!isSupported() || !hasBluetoothPermission()) return
         DualSenseBtReportBuilder.speakerVolumePercent = volumePercent.coerceIn(0, 100)
+        // Decode the demo clip on first use rather than at every stream start.
+        // Failure here must never be fatal: the preview is a nicety, and this
+        // runs on a caller thread that may not have a handler.
+        if(speakerPreviewPackets == null)
+        {
+            Thread {
+                try
+                {
+                    speakerPreviewPackets = DualSenseBtSpeakerAudio.loadDualFramePackets(appContext)
+                    synchronized(writerLock) { pendingSpeakerPreview = true }
+                    LockSupport.unpark(writerThread)
+                }
+                catch(e: Throwable)
+                {
+                    Log.w("DualSenseBtStream", "Speaker preview clip unavailable; skipping preview", e)
+                }
+            }.start()
+            return
+        }
         synchronized(writerLock) { pendingSpeakerPreview = true }
         LockSupport.unpark(writerThread)
     }

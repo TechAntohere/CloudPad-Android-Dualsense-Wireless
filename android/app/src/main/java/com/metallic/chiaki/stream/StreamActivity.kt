@@ -9,7 +9,9 @@ import android.Manifest
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.app.PictureInPictureParams
+import android.content.pm.PackageManager
 import android.content.res.Configuration
+import androidx.core.content.ContextCompat
 import android.graphics.Matrix
 import android.os.*
 import android.util.Log
@@ -112,6 +114,27 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 		pendingMicPermissionCallback?.invoke(granted)
 		pendingMicPermissionCallback = null
 	}
+
+	/**
+	 * BLUETOOTH_CONNECT is a runtime permission from Android 12 (API 31). Every
+	 * DualSense HID call needs it, and without it the BT bridge fails silently --
+	 * the console still streams haptics frames to us, we just can't write
+	 * anything back to the controller, which presents as "haptics don't work"
+	 * with nothing in the log.
+	 *
+	 * Asked for once per session, on connect, and only when a DualSense-class
+	 * device is actually present, so users without one are never prompted.
+	 */
+	private val bluetoothPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+		Log.i("StreamActivity", "BLUETOOTH_CONNECT granted=$granted")
+		if(granted && this::controllerFeedbackManager.isInitialized)
+		{
+			// Re-arm: the bridge gave up earlier when the permission was denied.
+			controllerFeedbackManager.handleSessionConnected(viewModel.session.connectInfo.ps5)
+			quickSettingsPanel.refreshDualSenseRows()
+		}
+	}
+	private var bluetoothPermissionRequested = false
 
 	private val uiVisibilityHandler = Handler()
 
@@ -226,6 +249,15 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 		binding = ActivityStreamBinding.inflate(layoutInflater)
 		setContentView(binding.root)
 		window.decorView.setOnSystemUiVisibilityChangeListener(this)
+
+		// Captured touchpad input arrives through this listener rather than an
+		// Activity override -- onCapturedPointerEvent is a View method.
+		if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+		{
+			binding.root.setOnCapturedPointerListener { _, event ->
+				viewModel.input.onCapturedTouchpadEvent(event)
+			}
+		}
 
 		trophyUnlockPopupPresenter = TrophyUnlockPopupPresenter(
 			container = binding.trophyUnlockPopup,
@@ -530,6 +562,31 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 
 	private val hideSystemUIRunnable = Runnable { hideSystemUI() }
 
+	/**
+	 * Ask for BLUETOOTH_CONNECT if a DualSense-class controller is attached and
+	 * we don't already hold it. Below API 31 the permission is install-time, so
+	 * there is nothing to do.
+	 */
+	private fun ensureBluetoothConnectPermission()
+	{
+		if(Build.VERSION.SDK_INT < Build.VERSION_CODES.S)
+			return
+		if(bluetoothPermissionRequested)
+			return
+		if(ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED)
+			return
+		// Don't prompt people who aren't using a DualSense at all.
+		val hasDualSense = InputDevice.getDeviceIds()
+			.map { InputDevice.getDevice(it) }
+			.filterNotNull()
+			.any { it.vendorId == 0x054c || it.name.contains("DualSense", ignoreCase = true) }
+		if(!hasDualSense)
+			return
+		bluetoothPermissionRequested = true
+		Log.i("StreamActivity", "Requesting BLUETOOTH_CONNECT for DualSense feedback")
+		bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+	}
+
 	// --- DualSense headphone volume -------------------------------------------
 
 	private fun adjustDualSenseHeadphoneVolume(raise: Boolean)
@@ -555,6 +612,13 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 		viewModel.preferences.controllerHeadphoneVolumePercent = next
 		if(this::controllerFeedbackManager.isInitialized)
 			controllerFeedbackManager.updateHeadphoneVolume(next)
+	}
+
+	/** Short audible preview through the controller so a new volume can be judged. */
+	fun playDualSenseVolumePreview(volumePercent: Int)
+	{
+		if(this::controllerFeedbackManager.isInitialized)
+			controllerFeedbackManager.playVolumePreview(volumePercent)
 	}
 
 	private fun showHeadphoneVolumeOverlay(volumePercent: Int)
@@ -600,8 +664,15 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 	override fun onWindowFocusChanged(hasFocus: Boolean)
 	{
 		super.onWindowFocusChanged(hasFocus)
+		// Pointer capture must be re-acquired on every focus gain; Android drops
+		// it whenever the window loses focus (Quick Settings, notifications, PiP).
 		if(hasFocus)
+		{
 			hideSystemUI()
+			requestTouchpadCapture()
+		}
+		else
+			releaseTouchpadCapture()
 	}
 
 	private fun hideSystemUI()
@@ -692,6 +763,7 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 				// video profile below, re-applied on every connect so a Quick
 				// Settings restart re-arms the path.
 				controllerFeedbackManager.handleSessionConnected(viewModel.session.connectInfo.ps5)
+				ensureBluetoothConnectPermission()
 
 				// Re-applied on every connect, not just the first — a Quick Settings "Apply"
 				// restart (see QuickSettingsPanel) can hand StreamSession a new videoProfile, and
@@ -863,8 +935,69 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
 		if(quickSettingsPanel.isCapturingInput && quickSettingsPanel.handleCaptureMotionEvent(event))
 			return true
 		controllerFeedbackManager.noteInputDevice(event.device)
+		// Cheap re-scan: picks up a controller that connected mid-session, since
+		// the IMU can only be attached once the device exists.
+		if(!viewModel.input.isControllerMotionActive)
+			viewModel.input.refreshControllerMotion()
+		// The DualSense touchpad is a separate input device and arrives here as a
+		// generic motion event, not a screen touch.
+		if(viewModel.input.onTouchpadMotionEvent(event))
+			return true
 		return viewModel.input.onGenericMotionEvent(event) || super.onGenericMotionEvent(event)
 	}
+
+	/**
+	 * Some devices deliver the controller's touchpad through the touch pipeline
+	 * (SOURCE_MOUSE) rather than as a generic motion event, so it is checked in
+	 * both places. onTouchpadMotionEvent ignores anything that isn't a
+	 * controller touchpad, so real screen touches fall through untouched.
+	 */
+	override fun dispatchTouchEvent(event: MotionEvent): Boolean
+	{
+		if(viewModel.input.onTouchpadMotionEvent(event))
+			return true
+		return super.dispatchTouchEvent(event)
+	}
+
+	/**
+	 * Touchpad events once the pointer is captured.
+	 *
+	 * Without capture, Android treats the DualSense touchpad as a system mouse:
+	 * it drives the on-screen cursor and the app never sees the events at all
+	 * (confirmed on-device -- only SOURCE_JOYSTICK events from the gamepad
+	 * device arrived, never anything from the separate touchpad device). Capture
+	 * redirects them here instead, which also removes the stray cursor.
+	 */
+	/**
+	 * Grabs the pointer so the controller touchpad reaches the app rather than
+	 * moving a cursor. Requires API 26, a focused window and a focusable view.
+	 */
+	private fun requestTouchpadCapture()
+	{
+		if(Build.VERSION.SDK_INT < Build.VERSION_CODES.O)
+			return
+		if(!hasWindowFocus())
+			return
+		val root = binding.root
+		root.isFocusable = true
+		root.isFocusableInTouchMode = true
+		root.post {
+			if(hasWindowFocus() && !root.hasPointerCapture())
+			{
+				root.requestFocus()
+				root.requestPointerCapture()
+			}
+		}
+	}
+
+	private fun releaseTouchpadCapture()
+	{
+		if(Build.VERSION.SDK_INT < Build.VERSION_CODES.O)
+			return
+		if(binding.root.hasPointerCapture())
+			binding.root.releasePointerCapture()
+	}
+
 }
 
 enum class TransformMode

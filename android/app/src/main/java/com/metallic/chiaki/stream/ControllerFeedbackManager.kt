@@ -80,6 +80,12 @@ class ControllerFeedbackManager(private val context: Context)
 	/** True once the BT feedback path has actually reached a DualSense. */
 	val isBluetoothControllerActive: Boolean get() = isBluetoothControllerOutputAvailable()
 
+	/** Play a short clip through the controller so a volume change can be heard. */
+	fun playVolumePreview(volumePercent: Int)
+	{
+		btStreamFeedback.feedPreviewTone(volumePercent)
+	}
+
 	fun onResume()
 	{
 		btStreamFeedback.onResume()

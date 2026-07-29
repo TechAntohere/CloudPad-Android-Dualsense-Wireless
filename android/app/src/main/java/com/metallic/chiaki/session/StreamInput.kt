@@ -3,6 +3,7 @@ package com.metallic.chiaki.session
 import android.content.Context
 import android.hardware.*
 import android.os.Handler
+import android.util.Log
 import android.os.Looper
 import android.view.*
 import androidx.lifecycle.Lifecycle
@@ -13,6 +14,9 @@ import com.metallic.chiaki.common.Preferences
 import com.metallic.chiaki.lib.ControllerState
 import kotlin.math.pow
 
+/** Sony. Used to recognise a DualSense's separate touchpad input device. */
+private const val PLAYSTATION_VENDOR_ID = 0x054c
+
 class StreamInput(
 	val context: Context,
 	val preferences: Preferences,
@@ -22,21 +26,32 @@ class StreamInput(
 
 	val controllerState: ControllerState get()
 	{
-		val controllerState = sensorControllerState or keyControllerState or motionControllerState
+		// A connected controller's own IMU wins over the tablet's: the player is
+		// holding the pad, not the tablet, so the tablet's motion is noise.
+		val usingControllerImu = controllerMotionInput.isActive
+		val motionSource = if(usingControllerImu) controllerImuState else sensorControllerState
+		val controllerState = motionSource or keyControllerState or motionControllerState or physicalTouchpadControllerState
 
-		val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-		@Suppress("DEPRECATION")
-		when(windowManager.defaultDisplay.rotation)
+		// This flip compensates for the *tablet* being held in landscape, so it
+		// must not be applied to controller-sourced motion -- the pad's
+		// orientation is independent of how the screen is rotated. Applying it
+		// anyway is what makes controller gyro feel like the axes are swapped.
+		if(!usingControllerImu)
 		{
-			Surface.ROTATION_90 -> {
-				controllerState.accelX *= -1.0f
-				controllerState.accelZ *= -1.0f
-				controllerState.gyroX *= -1.0f
-				controllerState.gyroZ *= -1.0f
-				controllerState.orientX *= -1.0f
-				controllerState.orientZ *= -1.0f
+			val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+			@Suppress("DEPRECATION")
+			when(windowManager.defaultDisplay.rotation)
+			{
+				Surface.ROTATION_90 -> {
+					controllerState.accelX *= -1.0f
+					controllerState.accelZ *= -1.0f
+					controllerState.gyroX *= -1.0f
+					controllerState.gyroZ *= -1.0f
+					controllerState.orientX *= -1.0f
+					controllerState.orientZ *= -1.0f
+				}
+				else -> {}
 			}
-			else -> {}
 		}
 
 		if(motionControllerState.l2State > 0U)
@@ -50,6 +65,69 @@ class StreamInput(
 	private val sensorControllerState = ControllerState()
 	private val keyControllerState = ControllerState()
 	private val motionControllerState = ControllerState()
+
+	/**
+	 * Touches read from the DualSense's own touchpad.
+	 *
+	 * Android exposes the physical touchpad as a *separate* input device from the
+	 * gamepad (its own /dev/input node with SOURCE_TOUCHPAD), which is why it
+	 * never reached the stream: nothing routed those MotionEvents. Kept apart
+	 * from [touchControllerState] so the on-screen touchpad overlay and the
+	 * hardware one can be active at the same time without fighting over touch ids.
+	 */
+	private var physicalTouchpadControllerState = ControllerState()
+
+	/** Android pointerId -> chiaki touch id, for touches currently down on the pad. */
+	private val touchpadPointers = mutableMapOf<Int, UByte>()
+
+	/** Diagnostic counter for non-touchscreen motion events, see onTouchpadMotionEvent. */
+	private var touchpadDiagCount = 0L
+	/** Diagnostic counter for captured-pointer events. */
+	private var capturedDiagCount = 0L
+
+	/**
+	 * Motion from the controller's own IMU. When a DualSense is connected this
+	 * supersedes the tablet's sensors entirely -- streaming the tablet's motion
+	 * while holding a controller is meaningless, and the controller's values are
+	 * calibrated per-unit by the kernel driver.
+	 */
+	private val controllerImuState = ControllerState()
+
+	/**
+	 * Fuses controller gyro+accel into the orientation quaternion.
+	 *
+	 * Writing gyro/accel alone is not sufficient: the feedback packet also
+	 * carries orientX/Y/Z/W, and leaving those at a constant identity makes the
+	 * host treat the pad as never rotating -- motion looks dead despite correct
+	 * gyro values arriving. The tracker also remaps both vectors into the
+	 * console's axis convention, which is not the identity mapping.
+	 */
+	private val controllerOrientationTracker = DualSenseOrientationTracker()
+	private val controllerMotionInput = ControllerMotionInput { gx, gy, gz, ax, ay, az, timestampNs ->
+		controllerOrientationTracker.update(gx, gy, gz, ax, ay, az, timestampNs)
+		controllerOrientationTracker.applyTo(controllerImuState)
+		controllerStateUpdated()
+	}
+
+	/** True when controller-sourced motion is live. */
+	val isControllerMotionActive: Boolean get() = controllerMotionInput.isActive
+
+	/**
+	 * Re-scan for a controller IMU, e.g. after a controller connects mid-session.
+	 * If one is found, the tablet's sensors are released so only a single motion
+	 * source is ever feeding the stream.
+	 */
+	fun refreshControllerMotion()
+	{
+		val wasActive = controllerMotionInput.isActive
+		controllerMotionInput.refresh()
+		if(!wasActive && controllerMotionInput.isActive)
+		{
+			val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+			sensorManager.unregisterListener(sensorEventListener)
+			controllerOrientationTracker.reset()
+		}
+	}
 
 	var touchControllerState = ControllerState()
 		set(value)
@@ -132,6 +210,15 @@ class StreamInput(
 	private val sensorEventListener = object: SensorEventListener {
 		override fun onSensorChanged(event: SensorEvent)
 		{
+			// The controller's own IMU supersedes the tablet's. Bail out before
+			// doing any work: the values would be discarded downstream anyway,
+			// but each call rebuilds the entire ControllerState through four
+			// chained `or`s (allocating a state and zipping the touch array each
+			// time) and pushes a packet. Left running, the tablet's three
+			// sensors and the controller's two interleave at ~300 rebuilds/sec
+			// from two unsynchronised clocks, which shows up as jittery motion.
+			if(controllerMotionInput.isActive)
+				return
 			when(event.sensor.type)
 			{
 				Sensor.TYPE_ACCELEROMETER -> {
@@ -164,6 +251,12 @@ class StreamInput(
 		@OnLifecycleEvent(Lifecycle.Event.ON_RESUME)
 		fun onResume()
 		{
+			// Try the controller's own IMU first; only fall back to the tablet's
+			// sensors if there isn't one, so the two never run concurrently.
+			controllerMotionInput.refresh()
+			if(controllerMotionInput.isActive)
+				return
+
 			val samplingPeriodUs = 4000
 			val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
 			listOfNotNull(
@@ -180,6 +273,7 @@ class StreamInput(
 		{
 			val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
 			sensorManager.unregisterListener(sensorEventListener)
+			controllerMotionInput.detach()
 		}
 	}
 
@@ -482,12 +576,239 @@ class StreamInput(
 
 	// ---- dispatchKeyEvent ----
 
+	// ---- Physical DualSense touchpad ----
+
+	/**
+	 * Whether a MotionEvent came from a controller's own touchpad rather than the
+	 * screen. Some vendors surface it as SOURCE_TOUCHPAD, others fold it into
+	 * SOURCE_MOUSE, so the mouse case is additionally checked against the device.
+	 */
+	private fun isControllerTouchpadMotionEvent(event: MotionEvent): Boolean
+	{
+		val source = event.source
+		if((source and InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD)
+			return true
+		if((source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE)
+			return isLikelyControllerTouchpadDevice(event.device)
+		return false
+	}
+
+	private fun isLikelyControllerTouchpadDevice(device: InputDevice?): Boolean
+	{
+		if(device == null)
+			return false
+		val sources = device.sources
+		if((sources and InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD)
+			return true
+		if(device.vendorId == PLAYSTATION_VENDOR_ID && device.name.contains("touchpad", ignoreCase = true))
+			return true
+		if(device.vendorId == PLAYSTATION_VENDOR_ID &&
+			(sources and (InputDevice.SOURCE_GAMEPAD or InputDevice.SOURCE_JOYSTICK)) != 0)
+			return true
+		return false
+	}
+
+	/** Maps a raw axis value onto the PS5 touchpad grid, using the device's own
+	 *  reported range where available. */
+	private fun touchpadCoordinate(value: Float, range: InputDevice.MotionRange?, maxExclusive: UShort): UShort
+	{
+		val maxIndex = maxExclusive.toInt() - 1
+		val normalized = when
+		{
+			range != null && range.range > 0.0f -> ((value - range.min) / range.range).coerceIn(0.0f, 1.0f)
+			value.isFinite() && value in 0.0f..1.0f -> value
+			else -> 0.0f
+		}
+		return (normalized * maxIndex.toFloat()).toInt().coerceIn(0, maxIndex).toUShort()
+	}
+
+	private fun touchpadAxis(event: MotionEvent, pointerIndex: Int, axis: Int, maxExclusive: UShort): UShort
+	{
+		val source = if((event.source and InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD)
+			InputDevice.SOURCE_TOUCHPAD
+		else
+			event.source
+		val range = event.device?.getMotionRange(axis, source) ?: event.device?.getMotionRange(axis)
+		val value = if(axis == MotionEvent.AXIS_X) event.getX(pointerIndex) else event.getY(pointerIndex)
+		return touchpadCoordinate(value, range, maxExclusive)
+	}
+
+	private fun clearTouchpadTouches()
+	{
+		val activeTouchIds = touchpadPointers.values.toList()
+		touchpadPointers.clear()
+		activeTouchIds.forEach { physicalTouchpadControllerState.stopTouch(it) }
+	}
+
+	private fun syncTouchpadPointers(event: MotionEvent, ignorePointerId: Int? = null)
+	{
+		val activePointerIds = LinkedHashSet<Int>(event.pointerCount)
+		for(pointerIndex in 0 until event.pointerCount)
+		{
+			val pointerId = event.getPointerId(pointerIndex)
+			if(pointerId == ignorePointerId)
+				continue
+			activePointerIds += pointerId
+			val x = touchpadAxis(event, pointerIndex, MotionEvent.AXIS_X, ControllerState.TOUCHPAD_WIDTH)
+			val y = touchpadAxis(event, pointerIndex, MotionEvent.AXIS_Y, ControllerState.TOUCHPAD_HEIGHT)
+			val touchId = touchpadPointers[pointerId]
+				?: physicalTouchpadControllerState.startTouch(x, y)?.also { touchpadPointers[pointerId] = it }
+				?: continue
+			physicalTouchpadControllerState.setTouchPos(touchId, x, y)
+		}
+
+		// Drop touches whose pointer vanished without an explicit UP.
+		val stalePointerIds = touchpadPointers.keys.filter { it !in activePointerIds }
+		stalePointerIds.forEach { pointerId ->
+			touchpadPointers.remove(pointerId)?.let { physicalTouchpadControllerState.stopTouch(it) }
+		}
+	}
+
+	/**
+	 * Feeds the controller's physical touchpad into the stream. Returns true when
+	 * the event was consumed, so the caller doesn't also treat it as a screen touch.
+	 */
+	/** Virtual cursor position for relative (mouse-style) captured touchpad input. */
+	private var capturedX = ControllerState.TOUCHPAD_WIDTH.toInt() / 2
+	private var capturedY = ControllerState.TOUCHPAD_HEIGHT.toInt() / 2
+	private var capturedTouchId: UByte? = null
+
+	/**
+	 * Touchpad input arriving via pointer capture.
+	 *
+	 * Under capture Android may report either absolute touchpad coordinates
+	 * (SOURCE_TOUCHPAD) or relative deltas (SOURCE_MOUSE_RELATIVE), depending on
+	 * device and vendor. Absolute is preferred when available; otherwise deltas
+	 * are integrated into a virtual position so the PS5 still sees a coherent
+	 * touch path.
+	 */
+	fun onCapturedTouchpadEvent(event: MotionEvent): Boolean
+	{
+		capturedDiagCount++
+		if(capturedDiagCount <= 20L || capturedDiagCount % 200L == 0L)
+			Log.i("TouchpadDiag", "CAPTURED #$capturedDiagCount src=0x${Integer.toHexString(event.source)}" +
+				" action=${event.actionMasked} btn=${event.buttonState} dev='${event.device?.name}'" +
+				" x=${event.x} y=${event.y} rel=(${event.getAxisValue(MotionEvent.AXIS_RELATIVE_X)}," +
+				"${event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y)})")
+
+		// Absolute path: treat exactly like an uncaptured touchpad event.
+		if((event.source and InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD)
+			return onTouchpadMotionEvent(event)
+
+		// Relative path: integrate deltas into a virtual position.
+		val dx = event.getAxisValue(MotionEvent.AXIS_RELATIVE_X)
+		val dy = event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y)
+		val maxX = ControllerState.TOUCHPAD_WIDTH.toInt() - 1
+		val maxY = ControllerState.TOUCHPAD_HEIGHT.toInt() - 1
+		capturedX = (capturedX + dx.toInt()).coerceIn(0, maxX)
+		capturedY = (capturedY + dy.toInt()).coerceIn(0, maxY)
+
+		val pressed = (event.buttonState and MotionEvent.BUTTON_PRIMARY) != 0
+		when(event.actionMasked)
+		{
+			MotionEvent.ACTION_DOWN, MotionEvent.ACTION_BUTTON_PRESS -> {
+				if(pressed)
+					keyControllerState.buttons = keyControllerState.buttons or ControllerState.BUTTON_TOUCHPAD
+			}
+			MotionEvent.ACTION_UP, MotionEvent.ACTION_BUTTON_RELEASE -> {
+				keyControllerState.buttons = keyControllerState.buttons and ControllerState.BUTTON_TOUCHPAD.inv()
+				capturedTouchId?.let { physicalTouchpadControllerState.stopTouch(it) }
+				capturedTouchId = null
+			}
+		}
+
+		// A relative device gives no notion of "finger down", so a touch is held
+		// for as long as movement continues; it is released on ACTION_UP above.
+		if(event.actionMasked == MotionEvent.ACTION_MOVE || event.actionMasked == MotionEvent.ACTION_HOVER_MOVE)
+		{
+			val id = capturedTouchId
+				?: physicalTouchpadControllerState.startTouch(capturedX.toUShort(), capturedY.toUShort())
+					?.also { capturedTouchId = it }
+			if(id != null)
+				physicalTouchpadControllerState.setTouchPos(id, capturedX.toUShort(), capturedY.toUShort())
+		}
+
+		controllerStateUpdated()
+		return true
+	}
+
+	fun onTouchpadMotionEvent(event: MotionEvent): Boolean
+	{
+		// Diagnostic: log any event from a non-touchscreen source so we can see
+		// what the controller touchpad actually arrives as -- or whether the
+		// system consumes it as a cursor before we ever see it.
+		if((event.source and InputDevice.SOURCE_TOUCHSCREEN) != InputDevice.SOURCE_TOUCHSCREEN)
+		{
+			touchpadDiagCount++
+			if(touchpadDiagCount <= 20L || touchpadDiagCount % 100L == 0L)
+				Log.i("TouchpadDiag", "#$touchpadDiagCount src=0x${Integer.toHexString(event.source)}" +
+					" action=${event.actionMasked} dev='${event.device?.name}' vid=0x${Integer.toHexString(event.device?.vendorId ?: 0)}" +
+					" accepted=${isControllerTouchpadMotionEvent(event)}")
+		}
+		if(!isControllerTouchpadMotionEvent(event))
+			return false
+
+		val isMouseSource = (event.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
+		when(event.actionMasked)
+		{
+			MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+				// A touchpad reported as a mouse presses its button on DOWN.
+				if(isMouseSource && event.actionMasked == MotionEvent.ACTION_DOWN)
+					keyControllerState.buttons = keyControllerState.buttons or ControllerState.BUTTON_TOUCHPAD
+				syncTouchpadPointers(event)
+			}
+			MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE -> syncTouchpadPointers(event)
+			MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+				val pointerId = event.getPointerId(event.actionIndex)
+				if(isMouseSource && event.actionMasked == MotionEvent.ACTION_UP)
+					keyControllerState.buttons = keyControllerState.buttons and ControllerState.BUTTON_TOUCHPAD.inv()
+				// The lifted pointer is still in the event, so exclude it explicitly.
+				syncTouchpadPointers(event, ignorePointerId = pointerId)
+				touchpadPointers.remove(pointerId)?.let { physicalTouchpadControllerState.stopTouch(it) }
+			}
+			MotionEvent.ACTION_CANCEL -> {
+				clearTouchpadTouches()
+				keyControllerState.buttons = keyControllerState.buttons and ControllerState.BUTTON_TOUCHPAD.inv()
+			}
+			MotionEvent.ACTION_BUTTON_PRESS -> {
+				if(event.actionButton == MotionEvent.BUTTON_PRIMARY)
+					keyControllerState.buttons = keyControllerState.buttons or ControllerState.BUTTON_TOUCHPAD
+				syncTouchpadPointers(event)
+			}
+			MotionEvent.ACTION_BUTTON_RELEASE -> {
+				if(event.actionButton == MotionEvent.BUTTON_PRIMARY)
+					keyControllerState.buttons = keyControllerState.buttons and ControllerState.BUTTON_TOUCHPAD.inv()
+				syncTouchpadPointers(event)
+			}
+			else -> return false
+		}
+
+		controllerStateUpdated()
+		return true
+	}
+
 	fun dispatchKeyEvent(event: KeyEvent): Boolean
 	{
 		if(event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP) return false
 		if(event.action == KeyEvent.ACTION_DOWN && event.repeatCount > 0)
 			return event.keyCode in comboModifierKeyCodes || event.keyCode in singleKeyToActions
 		val isDown = event.action == KeyEvent.ACTION_DOWN
+
+		// --- PHYSICAL PS BUTTON ---
+		// A real DualSense reports its PS button as BUTTON_MODE (scancode 0x13c
+		// in Vendor_054c_Product_0ce6.kl); some pads report BUTTON_C instead.
+		// DEFAULT_MAPPING only binds HOME to a SELECT+START combo, so on a pad
+		// that actually has the button, pressing it did nothing at all. Handled
+		// ahead of the combo layer because it is never a modifier, and left
+		// un-remappable so it always works even with a custom mapping.
+		if(event.keyCode == KeyEvent.KEYCODE_BUTTON_MODE || event.keyCode == KeyEvent.KEYCODE_BUTTON_C)
+		{
+			keyControllerState.buttons =
+				if(isDown) keyControllerState.buttons or ControllerState.BUTTON_PS
+				else keyControllerState.buttons and ControllerState.BUTTON_PS.inv()
+			controllerStateUpdated()
+			return true
+		}
 
 		// --- COMBO MODIFIER ---
 		if(event.keyCode in comboModifierKeyCodes)

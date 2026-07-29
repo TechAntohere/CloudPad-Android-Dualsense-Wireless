@@ -62,6 +62,10 @@ class SettingsActivity: AppCompatActivity(), PreferenceFragmentCompat.OnPreferen
 			replaceFragment(SettingsRegisteredHostsFragment(), true)
 			true
 		}
+		SettingsDualSenseMicProbeFragment::class.java.canonicalName -> {
+			replaceFragment(SettingsDualSenseMicProbeFragment(), true)
+			true
+		}
 		else -> false
 	}
 

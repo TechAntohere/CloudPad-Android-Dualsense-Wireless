@@ -96,6 +96,47 @@ static inline uint8_t chiaki_audio_channel_padspk(uint8_t controller_index)
 	return (uint8_t)(CHIAKI_AUDIO_CHANNEL_PADSPK_BASE + controller_index);
 }
 
+/**
+ * sceAudioOut port types, as the PS5 client picks them per Takion audio channel.
+ *
+ * Its openDevice() maps the channel to a local output port and opens it:
+ *
+ *   channel 1 (voice)        -> port type 2, for the initial user
+ *   channels 6-9 (padspk)    -> port type 4, for login user slot (channel - 2) & 3
+ *   anything else            -> port type 0
+ *
+ * The padspk case is selected by a predicate that is literally `channel >= 6 &&
+ * channel <= 9`, and the slot index by `(channel - 2) & 3` -- one expression that
+ * serves the haptic range too, since it folds 2-5 and 6-9 onto 0-3 alike.
+ *
+ * Those port handles are what the client then reports back to the host in an
+ * AUDIOSTATE PORTSTATES message, which is how the host learns an output for a
+ * channel is live. So a pad speaker lane is a port of type 4 being open and
+ * reported, not just a channel having been declared.
+ */
+#define CHIAKI_AUDIO_OUT_PORT_TYPE_MAIN   0
+#define CHIAKI_AUDIO_OUT_PORT_TYPE_VOICE  2
+#define CHIAKI_AUDIO_OUT_PORT_TYPE_PADSPK 4
+
+static inline uint8_t chiaki_audio_channel_out_port_type(uint8_t channel)
+{
+	if(channel == CHIAKI_AUDIO_CHANNEL_VOICE)
+		return CHIAKI_AUDIO_OUT_PORT_TYPE_VOICE;
+	if(chiaki_audio_channel_is_padspk(channel))
+		return CHIAKI_AUDIO_OUT_PORT_TYPE_PADSPK;
+	return CHIAKI_AUDIO_OUT_PORT_TYPE_MAIN;
+}
+
+/**
+ * Login-user slot a haptic or padspk channel belongs to, in the console's own single
+ * expression. Equivalent to chiaki_audio_channel_controller_index() across both of
+ * those ranges; like it, meaningless for any other channel.
+ */
+static inline uint8_t chiaki_audio_channel_user_slot(uint8_t channel)
+{
+	return (uint8_t)((channel - CHIAKI_AUDIO_CHANNEL_HAPTIC_BASE) & 3);
+}
+
 static inline const char *chiaki_audio_channel_kind_string(uint8_t channel)
 {
 	if(channel == CHIAKI_AUDIO_CHANNEL_MAIN)

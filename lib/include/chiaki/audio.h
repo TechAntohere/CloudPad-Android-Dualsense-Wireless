@@ -220,12 +220,11 @@ static inline size_t chiaki_audio_header_frame_buf_size(ChiakiAudioHeader *audio
  * is a field-major transpose of those across a group's four ports, so this struct is
  * also the wire layout.
  *
- * Identification rests on the import table rather than guesswork: every one of these
- * audio calls whose name is known independently, from its own error string, lands in
- * the library its name implies -- GetSpeakerInfo, GetHrtfIdForCronos and
- * GetTvCorrectionInfo in libSceAudioOut2, sceAudioOutOpen in libSceAudioOut. The port
- * state call sits in libSceAudioOut with sceAudioOutOpen, and the three offsets read
- * plus the 32-byte stack slot the caller gives it match SceAudioOutPortState exactly.
+ * The call is confirmed, not guessed: its NID, GrQ9s4IrNaQ, resolves to
+ * sceAudioOutGetPortState in a libSceAudioOut symbol table. That agrees with where the
+ * import sits (library libSceAudioOut, beside sceAudioOutOpen, rather than
+ * libSceAudioOut2), and the three offsets read plus the 32-byte stack slot the caller
+ * gives it match SceAudioOutPortState exactly.
  */
 typedef struct chiaki_audio_state_port_t
 {

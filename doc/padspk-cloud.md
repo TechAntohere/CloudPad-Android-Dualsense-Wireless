@@ -315,9 +315,15 @@ from its own error string, lands in the library its name implies:
 | `libSceAudioOut` (7) | `sceAudioOutOpen` |
 
 `GrQ9s4IrNaQ` sits in library 7 beside `sceAudioOutOpen`, so it is the v1
-**`sceAudioOutGetPortState`** — not a `sceAudioOut2` function. Its `SceAudioOutPortState`
-is 32 bytes, matching the caller's stack slot (`rbp-0x48` to `rbp-0x28`) derived
-separately, and the three offsets read land on named fields:
+**`sceAudioOutGetPortState`** — not a `sceAudioOut2` function.
+
+**This was since confirmed against a libSceAudioOut symbol table** (a genstub NID map,
+from fw 3.2): `GrQ9s4IrNaQ` -> `sceAudioOutGetPortState`, `ekNvsT22rsY` ->
+`sceAudioOutOpen`, `DImz2Ft9E2g` -> `sceAudioOut2GetSpeakerInfo`. The library-placement
+argument above held.
+
+Its `SceAudioOutPortState` is 32 bytes, matching the caller's stack slot (`rbp-0x48` to
+`rbp-0x28`) derived separately, and the three offsets read land on named fields:
 
 ```c
 typedef struct SceAudioOutPortState {
@@ -331,9 +337,31 @@ typedef struct SceAudioOutPortState {
 } SceAudioOutPortState;       // 32 bytes
 ```
 
-Caveat: NIDs are one-way hashes, so the *symbol* and *module* are resolved facts; the
-*name* is an identification from library placement plus struct fit. If the name is wrong
-the layout still holds.
+### The client's full audio API surface
+
+Resolving every audio import the same way gives the complete picture of what the cloud
+client does with local audio. 19 of 21 resolve directly; the two that do not are
+PS5-only and were already named from the binary's own error strings.
+
+| stub | NID | function | observed use |
+|---|---|---|---|
+| `0x30d4d0` | `DImz2Ft9E2g` | `sceAudioOut2GetSpeakerInfo` | AUDIOSTATE FLAGS/ANGLE source |
+| `0x30d4f0` | `RsOQBASFo68` | `sceAudioOut2GetHrtfIdForCronos` * | AUDIOSTATE HRTF source |
+| `0x30d500` | `e9rTn1fwgbQ` | `sceAudioOut2GetTvCorrectionInfo` * | AUDIOSTATE TVCONFIG source |
+| `0x30d510` | `GrQ9s4IrNaQ` | `sceAudioOutGetPortState` | AUDIOSTATE PORTSTATES source |
+| `0x30d520` | `JfEPXVxhFqA` | `sceAudioOutInit` | decoder ctor |
+| `0x30d530` | `QOQtbeDqsT4` | `sceAudioOutOutput` | teardown, `(handle, NULL)` |
+| `0x30d540` | `s1--uE9mBFw` | `sceAudioOutClose` | teardown |
+| `0x30d590` | `ekNvsT22rsY` | `sceAudioOutOpen` | `openDevice`, port type 4 for padspk |
+| | `b+uAV89IlxE` | `sceAudioOutSetVolume` | |
+| `0x30d550`..`0x30d570` | | `sceAudioOut2{Port,User,Context}Destroy` | 3D-audio path teardown |
+| | | `sceAudioOut2Initialize`, `ContextCreate`, `UserCreate`, `PortCreate`, `PortSetAttributes`, `ContextAdvance`, `ContextPush`, `ContextQueryMemory`, `ContextResetParam` | `openDevice2`, the >8-channel path |
+
+\* named from the binary's own error strings; absent from the fw 3.2 map because they are
+PS5-only.
+
+Note the teardown idiom this confirms: `sceAudioOutOutput(handle, NULL)` to drain, then
+`sceAudioOutClose(handle)`.
 
 ---
 
@@ -435,11 +463,16 @@ presumably what marks it as pad-speaker bound.
 
 Two ways to close it:
 
-- **`libSceAudioOut.sprx`** (`/system/common/lib/libSceAudioOut.sprx`) — the module is not
+- **`libSceAudioOut.sprx`, the binary** (`/system/common/lib/libSceAudioOut.sprx`) — not
   in the firmware dump this was read from, confirmed three ways: absent from all seven
   archive listings, absent from `libSceAudioSystem`'s parsed 323-symbol export table, and
   a sweep of every ELF in the dump finds the symbol as an undefined import in 11 modules
-  and defined in none. With that file the constants can be read off directly.
+  and defined in none. With the real module the constants can be read off the
+  implementation directly.
+
+  A **genstub `.c` is not enough** for this step. Those carry NID -> name mappings only —
+  no `#define`, no `enum`, no `struct` — which is what confirmed the function name above
+  but says nothing about the values. Only the module binary, or an SDK header, has those.
 - **Brute-force.** `output` is 16 bits with few meaningful values, `volume` is obvious,
   `flag`'s low half is likely small. The host gives a clean per-attempt yes/no, and no
   capture decryption is needed. Practical now that the search space is three named fields

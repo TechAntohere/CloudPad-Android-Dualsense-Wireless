@@ -202,11 +202,29 @@ static inline size_t chiaki_audio_header_frame_buf_size(ChiakiAudioHeader *audio
 #define CHIAKI_AUDIO_STATE_PORT_GROUPS      2
 #define CHIAKI_AUDIO_STATE_SPEAKER_ANGLES   16
 
-/** One port's state within a PORTSTATES group. */
+/**
+ * One port's state within a PORTSTATES group.
+ *
+ * These are the three fields the client copies out of sceAudioOut2GetPortState's
+ * output struct, at offsets 0x00, 0x04 and 0x08 -- a uint16, a uint16, and the low
+ * half of a qword read. Nothing else in that struct is used, and it is at most 32
+ * bytes, since the caller's stack slot ends there.
+ *
+ * The wire block is a straight field-major transpose of these across a group's four
+ * ports, so the layout below is the layout on the wire.
+ *
+ * What the three fields *mean* is not established here. The module that implements
+ * sceAudioOut2GetPortState is not part of the firmware dump this was read from, and
+ * the client calls it from exactly one place, so there is no second use to infer from.
+ * Treat the names as positional.
+ */
 typedef struct chiaki_audio_state_port_t
 {
+	/** sceAudioOut2GetPortState output +0x00. */
 	uint16_t word_0;
+	/** sceAudioOut2GetPortState output +0x04. */
 	uint16_t word_1;
+	/** sceAudioOut2GetPortState output +0x08. */
 	uint32_t dword_2;
 } ChiakiAudioStatePort;
 

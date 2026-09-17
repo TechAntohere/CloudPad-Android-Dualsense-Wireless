@@ -259,6 +259,8 @@ message AudioChannelPayload {
     required uint32 audio_channel_type = 1;
     required bytes audio_header = 2;
     optional bool is_raw_pcm = 3;
+    repeated bytes profile_header = 4;
+    optional uint32 fec_mode = 5;
 }
 
 message StreamInfoPayload {

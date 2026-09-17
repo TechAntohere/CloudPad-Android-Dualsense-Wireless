@@ -97,6 +97,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnecti
 	stream_connection->video_receiver = NULL;
 	stream_connection->audio_receiver = NULL;
 	stream_connection->haptics_receiver = NULL;
+	memset(stream_connection->padspk_receivers, 0, sizeof(stream_connection->padspk_receivers));
 
 	err = chiaki_mutex_init(&stream_connection->feedback_sender_mutex, false);
 	if(err != CHIAKI_ERR_SUCCESS)
@@ -223,13 +224,30 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_run(ChiakiStreamConnectio
 		goto err_audio_receiver;
 	}
 
+	// One receiver per pad speaker lane. Only allocated when something is listening,
+	// which is also the condition under which we advertise the lanes to the host.
+	if(session->padspk_sink.frame_cb)
+	{
+		for(size_t i = 0; i < CHIAKI_AUDIO_CHANNEL_CONTROLLERS_MAX; i++)
+		{
+			stream_connection->padspk_receivers[i] = chiaki_audio_receiver_new(session, NULL);
+			if(!stream_connection->padspk_receivers[i])
+			{
+				CHIAKI_LOGE(session->log, "StreamConnection failed to initialize Pad Speaker Receiver %zu", i);
+				err = CHIAKI_ERR_UNKNOWN;
+				chiaki_mutex_unlock(&stream_connection->state_mutex);
+				goto err_padspk_receivers;
+			}
+		}
+	}
+
 	stream_connection->video_receiver = chiaki_video_receiver_new(session, &stream_connection->packet_stats);
 	if(!stream_connection->video_receiver)
 	{
 		CHIAKI_LOGE(session->log, "StreamConnection failed to initialize Video Receiver");
 		err = CHIAKI_ERR_UNKNOWN;
 		chiaki_mutex_unlock(&stream_connection->state_mutex);
-		goto err_haptics_receiver;
+		goto err_padspk_receivers;
 	}
 
 	stream_connection->state = STATE_TAKION_CONNECT;
@@ -390,6 +408,15 @@ err_video_receiver:
 	chiaki_mutex_lock(&stream_connection->state_mutex);
 	chiaki_video_receiver_free(stream_connection->video_receiver);
 	stream_connection->video_receiver = NULL;
+	chiaki_mutex_unlock(&stream_connection->state_mutex);
+
+err_padspk_receivers:
+	chiaki_mutex_lock(&stream_connection->state_mutex);
+	for(size_t i = 0; i < CHIAKI_AUDIO_CHANNEL_CONTROLLERS_MAX; i++)
+	{
+		chiaki_audio_receiver_free(stream_connection->padspk_receivers[i]);
+		stream_connection->padspk_receivers[i] = NULL;
+	}
 	chiaki_mutex_unlock(&stream_connection->state_mutex);
 
 err_haptics_receiver:
@@ -1225,6 +1252,69 @@ static ChiakiErrorCode stream_connection_send_controller_connection(ChiakiStream
 	return chiaki_takion_send_message_data(&stream_connection->takion, 1, 1, buf, buf_size, NULL);
 }
 
+/**
+ * Whether this session may ask the host for the per-controller pad speaker lanes.
+ *
+ * Three things have to hold, all of them observed in the PS5 streaming stack:
+ *  - the host is PS Cloud. Retail Remote Play never creates a consumer for the padspk
+ *    channels at allocation time, so they are declared but never fed.
+ *  - the negotiated Takion protocol version sits in [15, 20]. Below that the host's
+ *    audio-settings path that carries per-channel declarations is not reached at all.
+ *  - the host is not mixing pad audio into the main output; if it is, the audio is
+ *    already in the main mix and a separate lane would duplicate it.
+ *
+ * A sink must also be attached, otherwise nothing would consume the frames.
+ */
+static bool stream_connection_padspk_available(ChiakiStreamConnection *stream_connection)
+{
+	ChiakiSession *session = stream_connection->session;
+	if(!session->connect_info.enable_padspk || !session->padspk_sink.frame_cb)
+		return false;
+	if(session->connect_info.padspk_mix_to_main)
+		return false;
+	if(!chiaki_service_type_is_cloud(session->service_type))
+		return false;
+	uint8_t version = stream_connection->takion.version;
+	return version >= CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MIN
+		&& version <= CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MAX;
+}
+
+typedef struct padspk_channels_context_t
+{
+	uint8_t audio_header[CHIAKI_AUDIO_HEADER_SIZE];
+	size_t count;
+} PadSpeakerChannelsContext;
+
+/** Encodes one AudioChannelPayload per controller into StreamInfoPayload.audio_channel. */
+static bool pb_encode_padspk_channels(pb_ostream_t *stream, const pb_field_t *field, void *const *arg)
+{
+	PadSpeakerChannelsContext *ctx = *arg;
+
+	for(size_t i = 0; i < ctx->count; i++)
+	{
+		tkproto_AudioChannelPayload channel;
+		memset(&channel, 0, sizeof(channel));
+
+		channel.audio_channel_type = chiaki_audio_channel_padspk((uint8_t)i);
+
+		ChiakiPBBuf audio_header_buf = { CHIAKI_AUDIO_HEADER_SIZE, ctx->audio_header };
+		channel.audio_header.arg = &audio_header_buf;
+		channel.audio_header.funcs.encode = chiaki_pb_encode_buf;
+
+		// The pad speaker lane is uncompressed: the frames arrive as interleavable
+		// mono s16 samples, exactly like the haptics lane, not as Opus packets.
+		channel.has_is_raw_pcm = true;
+		channel.is_raw_pcm = true;
+
+		if(!pb_encode_tag_for_field(stream, field))
+			return false;
+		if(!pb_encode_submessage(stream, tkproto_AudioChannelPayload_fields, &channel))
+			return false;
+	}
+
+	return true;
+}
+
 static ChiakiErrorCode stream_connection_enable_microphone(ChiakiStreamConnection *stream_connection)
 {
 	tkproto_TakionMessage msg;
@@ -1247,6 +1337,40 @@ static ChiakiErrorCode stream_connection_enable_microphone(ChiakiStreamConnectio
 	msg.stream_info_payload.has_afk_timeout = false;
 	msg.stream_info_payload.has_afk_timeout_disconnect = false;
 	msg.stream_info_payload.has_congestion_control_interval = false;
+
+	// Advertise the pad speaker lanes alongside the mic in the same audio settings
+	// message. The host allocates one padspk channel per local controller.
+	PadSpeakerChannelsContext padspk_ctx;
+	memset(&padspk_ctx, 0, sizeof(padspk_ctx));
+	if(stream_connection_padspk_available(stream_connection))
+	{
+		ChiakiAudioHeader padspk_header;
+		chiaki_audio_header_set(&padspk_header,
+			CHIAKI_AUDIO_PADSPK_CHANNELS, CHIAKI_AUDIO_PADSPK_BITS,
+			CHIAKI_AUDIO_PADSPK_RATE, CHIAKI_AUDIO_PADSPK_FRAME_SIZE);
+		chiaki_audio_header_save(&padspk_header, padspk_ctx.audio_header);
+		padspk_ctx.count = CHIAKI_AUDIO_CHANNEL_CONTROLLERS_MAX;
+
+		msg.stream_info_payload.audio_channel.arg = &padspk_ctx;
+		msg.stream_info_payload.audio_channel.funcs.encode = pb_encode_padspk_channels;
+
+		CHIAKI_LOGI(stream_connection->log,
+			"StreamConnection advertising %zu padspk channels (ids %u-%u, %uch/%ubit/%uHz/%u samples, raw pcm)",
+			padspk_ctx.count,
+			(unsigned int)chiaki_audio_channel_padspk(0),
+			(unsigned int)chiaki_audio_channel_padspk((uint8_t)(padspk_ctx.count - 1)),
+			(unsigned int)CHIAKI_AUDIO_PADSPK_CHANNELS, (unsigned int)CHIAKI_AUDIO_PADSPK_BITS,
+			(unsigned int)CHIAKI_AUDIO_PADSPK_RATE, (unsigned int)CHIAKI_AUDIO_PADSPK_FRAME_SIZE);
+	}
+	else if(stream_connection->session->connect_info.enable_padspk)
+	{
+		CHIAKI_LOGI(stream_connection->log,
+			"StreamConnection not advertising padspk channels (service_type=%s, takion version %u, mix_to_main=%s, sink=%s)",
+			chiaki_service_type_string(stream_connection->session->service_type),
+			(unsigned int)stream_connection->takion.version,
+			stream_connection->session->connect_info.padspk_mix_to_main ? "true" : "false",
+			stream_connection->session->padspk_sink.frame_cb ? "attached" : "none");
+	}
 
 	uint8_t buf[2048];
 	size_t buf_size;
@@ -1332,6 +1456,13 @@ static void stream_connection_takion_av(ChiakiStreamConnection *stream_connectio
 		chiaki_video_receiver_av_packet(stream_connection->video_receiver, packet);
 	else if(packet->is_haptics)
 	    chiaki_audio_receiver_av_packet(stream_connection->haptics_receiver, packet);
+	else if(chiaki_audio_channel_is_padspk(packet->audio_channel))
+	{
+		ChiakiAudioReceiver *receiver = stream_connection->padspk_receivers[
+			chiaki_audio_channel_controller_index(packet->audio_channel)];
+		if(receiver)
+			chiaki_audio_receiver_av_packet(receiver, packet);
+	}
 	else
 		chiaki_audio_receiver_av_packet(stream_connection->audio_receiver, packet);
 }

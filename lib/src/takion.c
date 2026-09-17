@@ -1,5 +1,6 @@
 #include "chiaki/feedback.h"
 #include <chiaki/takion.h>
+#include <chiaki/audio.h>
 #include <chiaki/congestioncontrol.h>
 #include <chiaki/random.h>
 #include <chiaki/gkcrypt.h>
@@ -1726,7 +1727,10 @@ static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uin
 		return;
 	}
 
-	if((takion->disable_audio_video & CHIAKI_AUDIO_DISABLED) && (base_type == TAKION_PACKET_TYPE_AUDIO) && !packet.is_haptics)
+	// Muting the stream's audio output must not silence the controller feedback lanes:
+	// haptics and pad speaker are per-controller, not part of the main mix.
+	if((takion->disable_audio_video & CHIAKI_AUDIO_DISABLED) && (base_type == TAKION_PACKET_TYPE_AUDIO)
+			&& !packet.is_haptics && !chiaki_audio_channel_is_padspk(packet.audio_channel))
 		return;
 
 	if(packet.is_video)
@@ -1923,7 +1927,9 @@ static ChiakiErrorCode av_packet_parse(bool v12, ChiakiTakionAVPacket *packet, C
 
 	if(v12 && !packet->is_video)
 	{
-		packet->is_haptics = *av == 0x02;
+		// Flat Takion audio channel id: main 0, voice 1, haptic 2+pad, padspk 6+pad.
+		packet->audio_channel = *av;
+		packet->is_haptics = chiaki_audio_channel_is_haptic(packet->audio_channel);
 		av += 1;
 		av_size -= 1;
 	}

@@ -219,8 +219,11 @@ typedef struct android_chiaki_session_t
 	jmethodID java_session_event_trigger_intensity_meth;
 	jmethodID java_session_event_trigger_effects_meth;
 	jmethodID java_session_event_haptics_frame_meth;
+	jmethodID java_session_event_padspk_frame_meth;
 	uint32_t haptics_frames_received;
 	uint32_t haptics_frames_dropped_small;
+	uint32_t padspk_frames_received;
+	uint32_t padspk_frames_dropped_small;
 	// Cached class refs for CHIAKI_EVENT_REGIST (FindClass doesn't work from native threads)
 	jclass java_target_class;
 	jmethodID java_target_from_value;
@@ -383,6 +386,68 @@ static void android_chiaki_haptics_frame(uint8_t *buf, size_t buf_size, void *us
 	if(!env)
 		return;
 	android_chiaki_emit_haptics_frame(env, session, buf, buf_size, native_elapsed_realtime_ns);
+	(*global_vm)->DetachCurrentThread(global_vm);
+}
+
+// ---------------------------------------------------------------------------
+// PS Cloud: per-controller pad speaker lanes (padspk).
+//
+// The host allocates one padspk channel per local controller and sends each as
+// raw mono s16 48 kHz PCM, alongside the haptics channels. Retail Remote Play
+// never creates a consumer for these, so this only ever carries audio on cloud
+// sessions. Frames are forwarded up to StreamSession, which feeds them to the
+// DualSense BT speaker path.
+// ---------------------------------------------------------------------------
+
+static void android_chiaki_padspk_header(ChiakiAudioHeader *header, void *user)
+{
+	AndroidChiakiSession *session = user;
+	if(!session || !header)
+		return;
+	CHIAKI_LOGI(session->log, "JNI padspk lane header: channels=%u bits=%u rate=%u frame_size=%u",
+		(unsigned int)header->channels, (unsigned int)header->bits,
+		(unsigned int)header->rate, (unsigned int)header->frame_size);
+}
+
+static void android_chiaki_padspk_frame(uint8_t controller_index, uint8_t *buf, size_t buf_size, void *user)
+{
+	AndroidChiakiSession *session = user;
+	int64_t native_elapsed_realtime_ns = android_chiaki_elapsed_realtime_nanos();
+	if(!buf || !buf_size)
+		return;
+
+	session->padspk_frames_received++;
+	// A frame below one whole sample carries no waveform; drop it but keep it visible.
+	if(buf_size < sizeof(int16_t))
+	{
+		session->padspk_frames_dropped_small++;
+		if(session->padspk_frames_dropped_small <= 8 || session->padspk_frames_dropped_small % 64 == 0)
+		{
+			CHIAKI_LOGW(session->log, "JNI dropping tiny padspk frame #%u with size=%llu",
+				(unsigned int)session->padspk_frames_dropped_small,
+				(unsigned long long)buf_size);
+		}
+		return;
+	}
+
+	if(session->padspk_frames_received <= 8 || session->padspk_frames_received % 256 == 0)
+	{
+		CHIAKI_LOGI(session->log, "JNI live padspk frame #%u pad=%u size=%llu",
+			(unsigned int)session->padspk_frames_received,
+			(unsigned int)controller_index,
+			(unsigned long long)buf_size);
+	}
+
+	JNIEnv *env = attach_thread_jni();
+	if(!env)
+		return;
+	jbyteArray data = jnibytearray_create(env, buf, buf_size);
+	E->CallVoidMethod(env, session->java_session,
+					  session->java_session_event_padspk_frame_meth,
+					  (jint)controller_index,
+					  data,
+					  (jlong)native_elapsed_realtime_ns);
+	E->DeleteLocalRef(env, data);
 	(*global_vm)->DetachCurrentThread(global_vm);
 }
 
@@ -626,6 +691,12 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 	jboolean auto_regist = E->GetBooleanField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "autoRegist", "Z"));
 	connect_info.auto_regist = auto_regist;
 
+	// Pad speaker lanes. Whether the host actually honours the request is decided in
+	// the lib (cloud only, Takion protocol 15-20, not mixing pad audio into main).
+	connect_info.enable_padspk = E->GetBooleanField(env, connect_info_obj,
+		E->GetFieldID(env, connect_info_class, "enablePadSpeaker", "Z"));
+	connect_info.padspk_mix_to_main = false;
+
 	// Cloud streaming fields (optional, null for remote play)
 	jstring service_type_string = E->GetObjectField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "serviceType", "Ljava/lang/String;"));
 	if(service_type_string)
@@ -822,6 +893,7 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 	session->java_session_event_trigger_intensity_meth = E->GetMethodID(env, session->java_session_class, "eventTriggerIntensity", "(I)V");
 	session->java_session_event_trigger_effects_meth = E->GetMethodID(env, session->java_session_class, "eventTriggerEffects", "(I[BI[B)V");
 	session->java_session_event_haptics_frame_meth = E->GetMethodID(env, session->java_session_class, "eventHapticsFrame", "([BJ)V");
+	session->java_session_event_padspk_frame_meth = E->GetMethodID(env, session->java_session_class, "eventPadSpeakerFrame", "(I[BJ)V");
 
 	// Cache class refs for CHIAKI_EVENT_REGIST (FindClass won't work from native threads)
 	session->java_target_class = E->NewGlobalRef(env, E->FindClass(env, BASE_PACKAGE"/Target"));
@@ -885,6 +957,18 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 		haptics_sink.frame_cb = android_chiaki_haptics_frame;
 		chiaki_session_set_haptics_sink(&session->session, &haptics_sink);
 		CHIAKI_LOGI(log, "JNI attached raw haptics sink");
+	}
+
+	// Pad speaker lanes. Attaching the sink is also what makes the lib advertise the
+	// padspk channels, so keep it off unless the feature is actually requested.
+	if(connect_info.enable_padspk)
+	{
+		ChiakiPadSpeakerSink padspk_sink = { 0 };
+		padspk_sink.user = session;
+		padspk_sink.header_cb = android_chiaki_padspk_header;
+		padspk_sink.frame_cb = android_chiaki_padspk_frame;
+		chiaki_session_set_padspk_sink(&session->session, &padspk_sink);
+		CHIAKI_LOGI(log, "JNI attached pad speaker sink");
 	}
 
 beach:

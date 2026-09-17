@@ -97,7 +97,14 @@ data class ConnectInfo(
 	val psnToken: String? = null,
 	val psnAccountId: String? = null, // base64-encoded 8-byte account ID
 	val holepunchSessionPtr: Long = 0L,
-	val autoRegist: Boolean = false // true for PSN auto-registration via holepunch
+	val autoRegist: Boolean = false, // true for PSN auto-registration via holepunch
+	/**
+	 * Ask the host for the per-controller pad speaker lanes (padspk).
+	 *
+	 * Only ever carries audio on cloud sessions: retail Remote Play declares the
+	 * channels but never creates a consumer for them at allocation.
+	 */
+	val enablePadSpeaker: Boolean = false
 ): Parcelable
 
 /** Which of the three session flows a [ConnectInfo] represents. There's no explicit flag for
@@ -588,6 +595,38 @@ data class HapticsFrameEvent(val data: ByteArray, val nativeElapsedRealtimeNs: L
 	override fun hashCode(): Int = 31 * data.contentHashCode() + nativeElapsedRealtimeNs.hashCode()
 }
 
+/**
+ * One frame of a controller's pad speaker lane: raw mono signed 16 bit 48 kHz PCM.
+ *
+ * [controllerIndex] is the local pad the lane belongs to (0-3); the host runs one
+ * padspk channel per controller. [nativeElapsedRealtimeNs] is CLOCK_BOOTTIME sampled
+ * on the native thread, matching SystemClock.elapsedRealtimeNanos(), for the same
+ * reason as [HapticsFrameEvent].
+ */
+data class PadSpeakerFrameEvent(
+	val controllerIndex: Int,
+	val data: ByteArray,
+	val nativeElapsedRealtimeNs: Long
+): Event()
+{
+	override fun equals(other: Any?): Boolean
+	{
+		if(this === other) return true
+		if(other !is PadSpeakerFrameEvent) return false
+		return controllerIndex == other.controllerIndex
+				&& nativeElapsedRealtimeNs == other.nativeElapsedRealtimeNs
+				&& data.contentEquals(other.data)
+	}
+
+	override fun hashCode(): Int
+	{
+		var result = controllerIndex
+		result = 31 * result + data.contentHashCode()
+		result = 31 * result + nativeElapsedRealtimeNs.hashCode()
+		return result
+	}
+}
+
 class CreateError(val errorCode: ErrorCode): Exception("Failed to create a native object: $errorCode")
 
 class Session(connectInfo: ConnectInfo, logFile: String?, logVerbose: Boolean)
@@ -689,6 +728,11 @@ class Session(connectInfo: ConnectInfo, logFile: String?, logVerbose: Boolean)
 	private fun eventHapticsFrame(data: ByteArray, nativeElapsedRealtimeNs: Long)
 	{
 		event(HapticsFrameEvent(data, nativeElapsedRealtimeNs))
+	}
+
+	private fun eventPadSpeakerFrame(controllerIndex: Int, data: ByteArray, nativeElapsedRealtimeNs: Long)
+	{
+		event(PadSpeakerFrameEvent(controllerIndex, data, nativeElapsedRealtimeNs))
 	}
 
 	fun setSurface(surface: Surface?)

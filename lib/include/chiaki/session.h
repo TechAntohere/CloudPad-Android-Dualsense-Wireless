@@ -82,6 +82,22 @@ typedef struct chiaki_connect_info_t
 	bool video_profile_auto_downgrade; // Downgrade video_profile if server does not seem to support it.
 	bool enable_keyboard;
 	bool enable_dualsense;
+	/**
+	 * Ask the host for the per-controller pad speaker lanes (padspk).
+	 *
+	 * Only honoured on PS Cloud: retail Remote Play never allocates a consumer for
+	 * these channels. The host also refuses them unless the negotiated Takion
+	 * protocol version is in [CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MIN,
+	 * CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MAX] and it is not mixing pad audio
+	 * into the main output.
+	 */
+	bool enable_padspk;
+	/**
+	 * Host mixes pad speaker audio into the main output rather than sending it on its
+	 * own lane. When true the padspk lanes are never advertised, because the audio is
+	 * already in the main mix and asking for both would double it.
+	 */
+	bool padspk_mix_to_main;
 	ChiakiDisableAudioVideo audio_video_disabled;
 	bool auto_regist;
 	ChiakiHolepunchSession holepunch_session;
@@ -230,6 +246,8 @@ typedef struct chiaki_session_t
 		ChiakiDisableAudioVideo disable_audio_video;
 		bool enable_keyboard;
 		bool enable_dualsense;
+		bool enable_padspk;
+		bool padspk_mix_to_main;
 		uint8_t psn_account_id[CHIAKI_PSN_ACCOUNT_ID_SIZE];
 	} connect_info;
 
@@ -261,6 +279,7 @@ typedef struct chiaki_session_t
 	void *video_sample_cb_user;
 	ChiakiAudioSink audio_sink;
 	ChiakiAudioSink haptics_sink;
+	ChiakiPadSpeakerSink padspk_sink;
 	ChiakiCtrlDisplaySink display_sink;
 
 	ChiakiThread session_thread;
@@ -333,6 +352,20 @@ static inline void chiaki_session_set_audio_sink(ChiakiSession *session, ChiakiA
 static inline void chiaki_session_set_haptics_sink(ChiakiSession *session, ChiakiAudioSink *sink)
 {
 	session->haptics_sink = *sink;
+}
+
+/**
+ * Attach a sink for the per-controller pad speaker lanes.
+ *
+ * Attaching a sink is also what makes the session advertise the padspk channels to
+ * the host, so the lanes stay off the wire unless something is listening. The host
+ * only allocates them for PS Cloud sessions.
+ *
+ * @param sink contents are copied
+ */
+static inline void chiaki_session_set_padspk_sink(ChiakiSession *session, ChiakiPadSpeakerSink *sink)
+{
+	session->padspk_sink = *sink;
 }
 
 /**

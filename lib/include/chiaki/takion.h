@@ -40,6 +40,12 @@ typedef struct chiaki_takion_av_packet_t
 	bool uses_nalu_info_structs;
 	bool is_video;
 	bool is_haptics;
+	/**
+	 * Takion audio channel id this packet belongs to (CHIAKI_AUDIO_CHANNEL_*).
+	 * Only meaningful for audio packets on protocol v12; older protocols carry no
+	 * channel byte and are always treated as the main channel.
+	 */
+	uint8_t audio_channel;
 	ChiakiSeqNum16 unit_index;
 	uint16_t units_in_frame_total; // source + units_in_frame_fec
 	uint16_t units_in_frame_fec;
@@ -259,6 +265,14 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *
 #define CHIAKI_TAKION_V9_AV_HEADER_SIZE_AUDIO 0x12
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_v9_av_packet_parse(ChiakiTakionAVPacket *packet, ChiakiKeyState *key_state, uint8_t *buf, size_t buf_size);
+
+/**
+ * Takion protocol versions for which the host will declare and accept the padspk
+ * audio channels. Outside this range the audio-settings path that carries them is
+ * never reached, so advertising them has no effect.
+ */
+#define CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MIN 15
+#define CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MAX 20
 
 #define CHIAKI_TAKION_V12_AV_HEADER_SIZE_VIDEO 0x17
 #define CHIAKI_TAKION_V12_AV_HEADER_SIZE_AUDIO 0x13

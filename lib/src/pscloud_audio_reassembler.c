@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
 
 #include "pscloud_audio_reassembler.h"
+#include <chiaki/audio.h>
 #include <chiaki/seqnum.h>
 #include <chiaki/time.h>
 
@@ -33,7 +34,7 @@ CHIAKI_EXPORT void chiaki_pscloud_audio_reassembler_fini(ChiakiPSCLOUDAudioReass
 {
 	free(reassembler->frame_buf);
 	free(reassembler->unit_received);
-	free(reassembler->unit_is_haptics);
+	free(reassembler->unit_channel);
 	memset(reassembler, 0, sizeof(ChiakiPSCLOUDAudioReassembler));
 }
 
@@ -74,6 +75,7 @@ static ChiakiErrorCode chiaki_pscloud_audio_reassembler_alloc_generation(
 	reassembler->source_units_emitted = false;
 	reassembler->generation_id++;
 	reassembler->first_frame_index = packet->frame_index;
+	reassembler->generation_channel = packet->audio_channel;
 	reassembler->units_source_expected = source;
 	reassembler->units_fec_expected = fec;
 	reassembler->units_total_expected = total;
@@ -95,15 +97,15 @@ static ChiakiErrorCode chiaki_pscloud_audio_reassembler_alloc_generation(
 	if(total != reassembler->unit_received_size)
 	{
 		free(reassembler->unit_received);
-		free(reassembler->unit_is_haptics);
+		free(reassembler->unit_channel);
 		reassembler->unit_received = calloc(total, sizeof(bool));
-		reassembler->unit_is_haptics = calloc(total, sizeof(bool));
-		if(!reassembler->unit_received || !reassembler->unit_is_haptics)
+		reassembler->unit_channel = calloc(total, sizeof(uint8_t));
+		if(!reassembler->unit_received || !reassembler->unit_channel)
 		{
 			free(reassembler->unit_received);
-			free(reassembler->unit_is_haptics);
+			free(reassembler->unit_channel);
 			reassembler->unit_received = NULL;
-			reassembler->unit_is_haptics = NULL;
+			reassembler->unit_channel = NULL;
 			reassembler->unit_received_size = 0;
 			return CHIAKI_ERR_MEMORY;
 		}
@@ -112,7 +114,7 @@ static ChiakiErrorCode chiaki_pscloud_audio_reassembler_alloc_generation(
 	else
 	{
 		memset(reassembler->unit_received, 0, total * sizeof(bool));
-		memset(reassembler->unit_is_haptics, 0, total * sizeof(bool));
+		memset(reassembler->unit_channel, 0, total * sizeof(uint8_t));
 	}
 	
 	// Allocate frame buffer
@@ -201,9 +203,9 @@ static ChiakiErrorCode chiaki_pscloud_audio_reassembler_fec(
 				if(idx < reassembler->units_source_expected)
 				{
 					reassembler->unit_received[idx] = true;
-					// Note: We don't know is_haptics for recovered units, assume false (audio)
-					// In practice, FEC recovery is rare and haptics/audio are usually separate
-					reassembler->unit_is_haptics[idx] = false;
+					// A generation only ever carries one channel, so a recovered unit
+					// belongs to whichever channel this generation is carrying.
+					reassembler->unit_channel[idx] = reassembler->generation_channel;
 					reassembler->units_source_received++;
 				}
 		}
@@ -216,7 +218,7 @@ static ChiakiErrorCode chiaki_pscloud_audio_reassembler_fec(
 CHIAKI_EXPORT ChiakiErrorCode chiaki_pscloud_audio_reassembler_put_packet(
 	ChiakiPSCLOUDAudioReassembler *reassembler,
 	ChiakiTakionAVPacket *packet,
-	void (*frame_cb)(ChiakiSeqNum16 frame_index, uint8_t *buf, size_t buf_size, bool is_haptics, void *user),
+	void (*frame_cb)(ChiakiSeqNum16 frame_index, uint8_t *buf, size_t buf_size, uint8_t audio_channel, void *user),
 	void *frame_cb_user)
 {
 	// For PSCLOUD, frame_index increments per packet, not per generation.
@@ -312,7 +314,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_pscloud_audio_reassembler_put_packet(
 					uint8_t *unit_buf = reassembler->frame_buf + i * reassembler->buf_stride_per_unit;
 					ChiakiSeqNum16 frame_index = (ChiakiSeqNum16)(reassembler->first_frame_index + i);
 					if(frame_cb)
-						frame_cb(frame_index, unit_buf, reassembler->unit_size, reassembler->unit_is_haptics[i], frame_cb_user);
+						frame_cb(frame_index, unit_buf, reassembler->unit_size, reassembler->unit_channel[i], frame_cb_user);
 				}
 			}
 		}
@@ -393,7 +395,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_pscloud_audio_reassembler_put_packet(
 	}
 	
 	reassembler->unit_received[packet->unit_index] = true;
-	reassembler->unit_is_haptics[packet->unit_index] = packet->is_haptics;
+	reassembler->unit_channel[packet->unit_index] = packet->audio_channel;
 	
 	if(packet->unit_index < reassembler->units_source_expected)
 		reassembler->units_source_received++;
@@ -409,7 +411,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_pscloud_audio_reassembler_put_packet(
 			uint8_t *unit_buf = reassembler->frame_buf + i * reassembler->buf_stride_per_unit;
 			ChiakiSeqNum16 frame_index = (ChiakiSeqNum16)(reassembler->first_frame_index + i);
 			if(frame_cb)
-				frame_cb(frame_index, unit_buf, reassembler->unit_size, reassembler->unit_is_haptics[i], frame_cb_user);
+				frame_cb(frame_index, unit_buf, reassembler->unit_size, reassembler->unit_channel[i], frame_cb_user);
 		}
 		reassembler->source_units_emitted = true;
 	}

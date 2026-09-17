@@ -18,6 +18,12 @@ typedef void (*ChiakiAudioSinkHeader)(ChiakiAudioHeader *header, void *user);
 typedef void (*ChiakiAudioSinkFrame)(uint8_t *buf, size_t buf_size, void *user);
 
 /**
+ * Frame of one controller's pad speaker lane. Unlike the main and haptics sinks this
+ * carries the controller index, because the host runs one padspk channel per pad.
+ */
+typedef void (*ChiakiPadSpeakerSinkFrame)(uint8_t controller_index, uint8_t *buf, size_t buf_size, void *user);
+
+/**
  * Sink that receives Audio encoded as Opus
  */
 typedef struct chiaki_audio_sink_t
@@ -26,6 +32,16 @@ typedef struct chiaki_audio_sink_t
 	ChiakiAudioSinkHeader header_cb;
 	ChiakiAudioSinkFrame frame_cb;
 } ChiakiAudioSink;
+
+/**
+ * Sink that receives raw pad speaker PCM (mono s16 48 kHz), tagged with a controller index.
+ */
+typedef struct chiaki_pad_speaker_sink_t
+{
+	void *user;
+	ChiakiAudioSinkHeader header_cb;
+	ChiakiPadSpeakerSinkFrame frame_cb;
+} ChiakiPadSpeakerSink;
 
 typedef struct chiaki_audio_receiver_t
 {

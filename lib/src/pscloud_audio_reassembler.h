@@ -35,10 +35,12 @@ typedef struct chiaki_pscloud_audio_reassembler_t
 	size_t frame_buf_size;
 	size_t buf_stride_per_unit;
 	
-	// Track which units we've received and their haptics flag
+	// Track which units we've received and which Takion audio channel each carries
 	bool *unit_received;
-	bool *unit_is_haptics; // Track is_haptics per unit
+	uint8_t *unit_channel; // CHIAKI_AUDIO_CHANNEL_* per unit
 	size_t unit_received_size;
+	// All units of a generation belong to one channel; used for FEC-recovered units.
+	uint8_t generation_channel;
 	
 	// Counters
 	uint16_t units_source_received;
@@ -65,14 +67,14 @@ CHIAKI_EXPORT void chiaki_pscloud_audio_reassembler_fini(ChiakiPSCLOUDAudioReass
  * Process a PSCLOUD audio AV packet
  * @param reassembler The reassembler instance
  * @param packet The AV packet (must be PSCLOUD format)
- * @param frame_cb Callback to emit completed source units (called with frame_index, is_haptics from packet)
+ * @param frame_cb Callback to emit completed source units (called with frame_index and the packet's audio channel)
  * @param frame_cb_user User data for frame_cb
  * @return CHIAKI_ERR_SUCCESS on success, other on error
  */
 CHIAKI_EXPORT ChiakiErrorCode chiaki_pscloud_audio_reassembler_put_packet(
 	ChiakiPSCLOUDAudioReassembler *reassembler,
 	ChiakiTakionAVPacket *packet,
-	void (*frame_cb)(ChiakiSeqNum16 frame_index, uint8_t *buf, size_t buf_size, bool is_haptics, void *user),
+	void (*frame_cb)(ChiakiSeqNum16 frame_index, uint8_t *buf, size_t buf_size, uint8_t audio_channel, void *user),
 	void *frame_cb_user);
 
 #ifdef __cplusplus

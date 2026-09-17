@@ -7,13 +7,13 @@
 
 #include <string.h>
 
-static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, ChiakiSeqNum16 frame_index, bool is_haptics, uint8_t *buf, size_t buf_size);
+static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, ChiakiSeqNum16 frame_index, uint8_t audio_channel, uint8_t *buf, size_t buf_size);
 
 // Callback for PSCLOUD audio reassembler - emits units with frame_index from reassembler
-static void pscloud_audio_reassembler_frame_cb(ChiakiSeqNum16 frame_index, uint8_t *buf, size_t buf_size, bool is_haptics, void *user)
+static void pscloud_audio_reassembler_frame_cb(ChiakiSeqNum16 frame_index, uint8_t *buf, size_t buf_size, uint8_t audio_channel, void *user)
 {
 	ChiakiAudioReceiver *audio_receiver = (ChiakiAudioReceiver *)user;
-	chiaki_audio_receiver_frame(audio_receiver, frame_index, is_haptics, buf, buf_size);
+	chiaki_audio_receiver_frame(audio_receiver, frame_index, audio_channel, buf, buf_size);
 	if(audio_receiver->packet_stats)
 		chiaki_packet_stats_push_seq(audio_receiver->packet_stats, frame_index);
 }
@@ -167,14 +167,14 @@ CHIAKI_EXPORT void chiaki_audio_receiver_av_packet(ChiakiAudioReceiver *audio_re
 			frame_index = packet->frame_index - fec_units_count + fec_index;
 		}
 
-		chiaki_audio_receiver_frame(audio_receiver, frame_index, packet->is_haptics, packet->data + unit_size * i, unit_size);
+		chiaki_audio_receiver_frame(audio_receiver, frame_index, packet->audio_channel, packet->data + unit_size * i, unit_size);
 	}
 
 	if(audio_receiver->packet_stats)
 		chiaki_packet_stats_push_seq(audio_receiver->packet_stats, packet->frame_index);
 }
 
-static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, ChiakiSeqNum16 frame_index, bool is_haptics, uint8_t *buf, size_t buf_size)
+static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, ChiakiSeqNum16 frame_index, uint8_t audio_channel, uint8_t *buf, size_t buf_size)
 {
 	chiaki_mutex_lock(&audio_receiver->mutex);
 
@@ -182,9 +182,21 @@ static void chiaki_audio_receiver_frame(ChiakiAudioReceiver *audio_receiver, Chi
 		goto beach;
 	audio_receiver->frame_index_prev = frame_index;
 
-	if(is_haptics && audio_receiver->session->haptics_sink.frame_cb)
-		audio_receiver->session->haptics_sink.frame_cb(buf, buf_size, audio_receiver->session->haptics_sink.user);
-	else if(!is_haptics && audio_receiver->session->audio_sink.frame_cb)
+	if(chiaki_audio_channel_is_padspk(audio_channel))
+	{
+		if(audio_receiver->session->padspk_sink.frame_cb)
+		{
+			audio_receiver->session->padspk_sink.frame_cb(
+				chiaki_audio_channel_controller_index(audio_channel),
+				buf, buf_size, audio_receiver->session->padspk_sink.user);
+		}
+	}
+	else if(chiaki_audio_channel_is_haptic(audio_channel))
+	{
+		if(audio_receiver->session->haptics_sink.frame_cb)
+			audio_receiver->session->haptics_sink.frame_cb(buf, buf_size, audio_receiver->session->haptics_sink.user);
+	}
+	else if(audio_receiver->session->audio_sink.frame_cb)
 		audio_receiver->session->audio_sink.frame_cb(buf, buf_size, audio_receiver->session->audio_sink.user);
 
 beach:

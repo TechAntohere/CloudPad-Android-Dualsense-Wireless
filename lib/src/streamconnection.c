@@ -101,13 +101,16 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_send_audio_state(
 	if(data && data_size)
 		memcpy(payload, data, data_size);
 
-	// The port mask lives at offset 1 of the blob for the whole-state types. A mask
-	// wider than 8 bits is its own feature, and a host without it rejects the update
-	// outright, so clamp rather than let the message be dropped.
+	// The port availability mask is the dword at offset 1 of a FLAGS or FULL blob. A
+	// mask wider than 8 bits is its own feature, and a host without it rejects the
+	// update outright, so clamp rather than let the message be dropped.
+	//
+	// The PS5 client clamps for ANGLE too, which carries no mask at that offset -- only
+	// packed speaker positions -- so doing the same would corrupt them. Clamp only the
+	// two types that actually have a mask there.
 	if(data_size >= 1 + sizeof(uint32_t)
 			&& (audio_state_type == tkproto_AudioStatePayload_AudioStateType_FULL
-				|| audio_state_type == tkproto_AudioStatePayload_AudioStateType_FLAGS
-				|| audio_state_type == tkproto_AudioStatePayload_AudioStateType_ANGLE)
+				|| audio_state_type == tkproto_AudioStatePayload_AudioStateType_FLAGS)
 			&& !chiaki_takion_protocol_feature_supported(version, CHIAKI_TAKION_FEATURE_AUDIO_WIDE_PORT_MASK))
 	{
 		uint32_t available_bits;

@@ -127,6 +127,70 @@ static inline size_t chiaki_audio_header_frame_buf_size(ChiakiAudioHeader *audio
 	return audio_header->frame_size * audio_header->channels * sizeof(int16_t);
 }
 
+/**
+ * AUDIOSTATE payload blobs.
+ *
+ * The client describes its own audio output setup to the host through AUDIOSTATE, and
+ * the blob layout is chosen by the state type. On the PS5 client these are filled from
+ * sceAudioOut2GetSpeakerInfo, sceAudioOut2GetHrtfIdForCronos,
+ * sceAudioOut2GetTvCorrectionInfo and sceAudioOut2GetPortState, and each type is sent
+ * only when the values behind it change:
+ *
+ *   HRTF (3)       4 bytes   the HRTF id
+ *   FLAGS (1)      9 bytes   speaker kind byte, then two dwords, the first of which is
+ *                            the port availability mask (see the wide-mask feature)
+ *   ANGLE (2)     64 bytes   16 speaker positions, two uint16 each
+ *   FULL (0)      73 bytes   the FLAGS 9 bytes followed by the ANGLE 64
+ *   TVCONFIG (4) 188 bytes   a dword, two 90-byte correction blocks, then 2 + 2 bytes
+ *   PORTSTATES (5) 33 bytes  group index byte, then that group's 32-byte port block
+ *
+ * PORTSTATES is the interesting one for the pad speaker: the client opens local output
+ * ports per audio channel type and reports them here, in groups of four, which is how
+ * the host learns an output for a channel is actually live.
+ */
+#define CHIAKI_AUDIO_STATE_HRTF_SIZE        4
+#define CHIAKI_AUDIO_STATE_FLAGS_SIZE       9
+#define CHIAKI_AUDIO_STATE_ANGLE_SIZE       64
+#define CHIAKI_AUDIO_STATE_FULL_SIZE        (CHIAKI_AUDIO_STATE_FLAGS_SIZE + CHIAKI_AUDIO_STATE_ANGLE_SIZE)
+#define CHIAKI_AUDIO_STATE_TVCONFIG_SIZE    188
+#define CHIAKI_AUDIO_STATE_PORTSTATES_SIZE  33
+/** Largest of the above, and the size the client allocates for every blob. */
+#define CHIAKI_AUDIO_STATE_MAX_SIZE         CHIAKI_AUDIO_STATE_TVCONFIG_SIZE
+
+#define CHIAKI_AUDIO_STATE_PORTS_PER_GROUP  4
+#define CHIAKI_AUDIO_STATE_PORT_GROUPS      2
+#define CHIAKI_AUDIO_STATE_SPEAKER_ANGLES   16
+
+/** One port's state within a PORTSTATES group. */
+typedef struct chiaki_audio_state_port_t
+{
+	uint16_t word_0;
+	uint16_t word_1;
+	uint32_t dword_2;
+} ChiakiAudioStatePort;
+
+/** One speaker position in an ANGLE or FULL blob. */
+typedef struct chiaki_audio_state_angle_t
+{
+	uint16_t a;
+	uint16_t b;
+} ChiakiAudioStateAngle;
+
+/**
+ * Build an AUDIOSTATE blob. Each returns the number of bytes written, or 0 if the
+ * buffer is too small for that type.
+ */
+CHIAKI_EXPORT size_t chiaki_audio_state_build_hrtf(uint8_t *buf, size_t buf_size, uint32_t hrtf_id);
+CHIAKI_EXPORT size_t chiaki_audio_state_build_flags(uint8_t *buf, size_t buf_size,
+		uint8_t speaker_kind, uint32_t available_bits, uint32_t dword_2);
+CHIAKI_EXPORT size_t chiaki_audio_state_build_angle(uint8_t *buf, size_t buf_size,
+		const ChiakiAudioStateAngle *angles);
+CHIAKI_EXPORT size_t chiaki_audio_state_build_full(uint8_t *buf, size_t buf_size,
+		uint8_t speaker_kind, uint32_t available_bits, uint32_t dword_2,
+		const ChiakiAudioStateAngle *angles);
+CHIAKI_EXPORT size_t chiaki_audio_state_build_port_states(uint8_t *buf, size_t buf_size,
+		uint8_t group, const ChiakiAudioStatePort *ports);
+
 #ifdef __cplusplus
 }
 #endif

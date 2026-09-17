@@ -20,8 +20,8 @@ extern "C" {
 
 typedef struct chiaki_session_t ChiakiSession;
 
-/** Largest AUDIOSTATE payload blob this code will send. */
-#define CHIAKI_STREAM_CONNECTION_AUDIO_STATE_MAX_SIZE 64
+/** Largest AUDIOSTATE payload blob this code will send (TVCONFIG, the biggest type). */
+#define CHIAKI_STREAM_CONNECTION_AUDIO_STATE_MAX_SIZE CHIAKI_AUDIO_STATE_MAX_SIZE
 
 typedef enum chiaki_dualsense_effect_intensity_t
 {

@@ -113,9 +113,9 @@ CHIAKI_EXPORT size_t chiaki_audio_state_build_port_states(uint8_t *buf, size_t b
 	uint8_t *block = buf + 1;
 	for(size_t i = 0; i < CHIAKI_AUDIO_STATE_PORTS_PER_GROUP; i++)
 	{
-		memcpy(block + i * sizeof(uint16_t), &ports[i].word_0, sizeof(uint16_t));
-		memcpy(block + 0x08 + i * sizeof(uint16_t), &ports[i].word_1, sizeof(uint16_t));
-		memcpy(block + 0x10 + i * sizeof(uint32_t), &ports[i].dword_2, sizeof(uint32_t));
+		memcpy(block + i * sizeof(uint16_t), &ports[i].output, sizeof(uint16_t));
+		memcpy(block + 0x08 + i * sizeof(uint16_t), &ports[i].volume, sizeof(uint16_t));
+		memcpy(block + 0x10 + i * sizeof(uint32_t), &ports[i].flag, sizeof(uint32_t));
 	}
 
 	return CHIAKI_AUDIO_STATE_PORTSTATES_SIZE;

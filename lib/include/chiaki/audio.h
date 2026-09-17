@@ -205,27 +205,36 @@ static inline size_t chiaki_audio_header_frame_buf_size(ChiakiAudioHeader *audio
 /**
  * One port's state within a PORTSTATES group.
  *
- * These are the three fields the client copies out of sceAudioOut2GetPortState's
- * output struct, at offsets 0x00, 0x04 and 0x08 -- a uint16, a uint16, and the low
- * half of a qword read. Nothing else in that struct is used, and it is at most 32
- * bytes, since the caller's stack slot ends there.
+ * The client fills these from the port-state call in libSceAudioOut -- the v1 library,
+ * not libSceAudioOut2, so this is sceAudioOutGetPortState and its SceAudioOutPortState:
  *
- * The wire block is a straight field-major transpose of these across a group's four
- * ports, so the layout below is the layout on the wire.
+ *   +0x00  uint16  output          output destination mask
+ *   +0x02  uint8   channel
+ *   +0x03  uint8   reserved
+ *   +0x04  int16   volume
+ *   +0x06  uint16  rerouteCounter
+ *   +0x08  uint64  flag
+ *   +0x10  uint64  reserved[2]                                    -- 32 bytes total
  *
- * What the three fields *mean* is not established here. The module that implements
- * sceAudioOut2GetPortState is not part of the firmware dump this was read from, and
- * the client calls it from exactly one place, so there is no second use to infer from.
- * Treat the names as positional.
+ * Only three are copied out: output, volume, and the low half of flag. The wire block
+ * is a field-major transpose of those across a group's four ports, so this struct is
+ * also the wire layout.
+ *
+ * Identification rests on the import table rather than guesswork: every one of these
+ * audio calls whose name is known independently, from its own error string, lands in
+ * the library its name implies -- GetSpeakerInfo, GetHrtfIdForCronos and
+ * GetTvCorrectionInfo in libSceAudioOut2, sceAudioOutOpen in libSceAudioOut. The port
+ * state call sits in libSceAudioOut with sceAudioOutOpen, and the three offsets read
+ * plus the 32-byte stack slot the caller gives it match SceAudioOutPortState exactly.
  */
 typedef struct chiaki_audio_state_port_t
 {
-	/** sceAudioOut2GetPortState output +0x00. */
-	uint16_t word_0;
-	/** sceAudioOut2GetPortState output +0x04. */
-	uint16_t word_1;
-	/** sceAudioOut2GetPortState output +0x08. */
-	uint32_t dword_2;
+	/** SceAudioOutPortState.output, +0x00: where this port's audio is being sent. */
+	uint16_t output;
+	/** SceAudioOutPortState.volume, +0x04. Signed in the SDK struct; carried as-is. */
+	uint16_t volume;
+	/** Low 32 bits of SceAudioOutPortState.flag, +0x08. */
+	uint32_t flag;
 } ChiakiAudioStatePort;
 
 /** One speaker position in an ANGLE or FULL blob. */

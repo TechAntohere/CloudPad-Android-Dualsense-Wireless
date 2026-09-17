@@ -57,6 +57,97 @@ static ChiakiErrorCode stream_connection_send_disconnect(ChiakiStreamConnection 
 static void stream_connection_takion_data_idle(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size);
 static void stream_connection_takion_data_expect_bang(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size);
 static void stream_connection_takion_data_expect_streaminfo(ChiakiStreamConnection *stream_connection, uint8_t *buf, size_t buf_size);
+/**
+ * Send an AUDIOSTATE message: the channel through which the client tells the host
+ * what its audio ports and channels are currently doing.
+ *
+ * This is the message the host wants before it will feed the optional lanes -- having
+ * the padspk channels declared gets them allocated, but nothing is produced for a
+ * channel the host has not been told is live. Note what gates it: the host drops every
+ * audio state update unless the negotiated protocol version carries the *padspk*
+ * feature, so the same version step that makes the lanes declarable is also what makes
+ * them requestable.
+ *
+ * @param audio_state_type one of tkproto_AudioStatePayload_AudioStateType
+ * @param data payload blob for that type, may be NULL
+ */
+CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_send_audio_state(
+		ChiakiStreamConnection *stream_connection,
+		uint32_t audio_state_type, const uint8_t *data, size_t data_size)
+{
+	uint8_t version = stream_connection->takion.version;
+
+	if(!chiaki_takion_protocol_feature_supported(version, CHIAKI_TAKION_FEATURE_PADSPK))
+	{
+		CHIAKI_LOGW(stream_connection->log,
+			"StreamConnection cannot send audio state: takion version %u does not carry the feature that enables AUDIOSTATE",
+			(unsigned int)version);
+		return CHIAKI_ERR_UNKNOWN;
+	}
+
+	if(audio_state_type == tkproto_AudioStatePayload_AudioStateType_CHANNELNUM
+			&& !chiaki_takion_protocol_feature_supported(version, CHIAKI_TAKION_FEATURE_AUDIO_CHANNELNUM))
+	{
+		CHIAKI_LOGW(stream_connection->log,
+			"StreamConnection cannot send audio state CHANNELNUM: takion version %u does not support it",
+			(unsigned int)version);
+		return CHIAKI_ERR_UNKNOWN;
+	}
+
+	if(data_size > CHIAKI_STREAM_CONNECTION_AUDIO_STATE_MAX_SIZE)
+		return CHIAKI_ERR_BUF_TOO_SMALL;
+
+	uint8_t payload[CHIAKI_STREAM_CONNECTION_AUDIO_STATE_MAX_SIZE];
+	if(data && data_size)
+		memcpy(payload, data, data_size);
+
+	// The port mask lives at offset 1 of the blob for the whole-state types. A mask
+	// wider than 8 bits is its own feature, and a host without it rejects the update
+	// outright, so clamp rather than let the message be dropped.
+	if(data_size >= 1 + sizeof(uint32_t)
+			&& (audio_state_type == tkproto_AudioStatePayload_AudioStateType_FULL
+				|| audio_state_type == tkproto_AudioStatePayload_AudioStateType_FLAGS
+				|| audio_state_type == tkproto_AudioStatePayload_AudioStateType_ANGLE)
+			&& !chiaki_takion_protocol_feature_supported(version, CHIAKI_TAKION_FEATURE_AUDIO_WIDE_PORT_MASK))
+	{
+		uint32_t available_bits;
+		memcpy(&available_bits, payload + 1, sizeof(available_bits));
+		if(available_bits > 0xff)
+		{
+			CHIAKI_LOGI(stream_connection->log,
+				"StreamConnection audio state port mask 0x%x is wider than takion version %u supports, clamping to 0xff",
+				(unsigned int)available_bits, (unsigned int)version);
+			available_bits = 0xff;
+			memcpy(payload + 1, &available_bits, sizeof(available_bits));
+		}
+	}
+
+	tkproto_TakionMessage msg;
+	memset(&msg, 0, sizeof(msg));
+	msg.type = tkproto_TakionMessage_PayloadType_AUDIOSTATE;
+	msg.has_audio_state = true;
+	msg.audio_state.audio_state_type = audio_state_type;
+
+	ChiakiPBBuf data_buf = { data_size, payload };
+	if(data_size)
+	{
+		msg.audio_state.audio_state_data.arg = &data_buf;
+		msg.audio_state.audio_state_data.funcs.encode = chiaki_pb_encode_buf;
+	}
+
+	uint8_t buf[256];
+	pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+	if(!pb_encode(&stream, tkproto_TakionMessage_fields, &msg))
+	{
+		CHIAKI_LOGE(stream_connection->log, "StreamConnection audio state protobuf encoding failed");
+		return CHIAKI_ERR_UNKNOWN;
+	}
+
+	CHIAKI_LOGI(stream_connection->log, "StreamConnection sending audio state type %u (%zu byte payload)",
+		(unsigned int)audio_state_type, data_size);
+	return chiaki_takion_send_message_data(&stream_connection->takion, 1, 1, buf, stream.bytes_written, NULL);
+}
+
 static ChiakiErrorCode stream_connection_send_streaminfo_ack(ChiakiStreamConnection *stream_connection);
 static void stream_connection_takion_av(ChiakiStreamConnection *stream_connection, ChiakiTakionAVPacket *packet);
 static ChiakiErrorCode stream_connection_send_heartbeat(ChiakiStreamConnection *stream_connection);
@@ -1274,9 +1365,8 @@ static bool stream_connection_padspk_available(ChiakiStreamConnection *stream_co
 		return false;
 	if(!chiaki_service_type_is_cloud(session->service_type))
 		return false;
-	uint8_t version = stream_connection->takion.version;
-	return version >= CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MIN
-		&& version <= CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MAX;
+	return chiaki_takion_protocol_feature_supported(stream_connection->takion.version,
+		CHIAKI_TAKION_FEATURE_PADSPK);
 }
 
 typedef struct padspk_channels_context_t
@@ -1369,7 +1459,7 @@ static ChiakiErrorCode stream_connection_enable_microphone(ChiakiStreamConnectio
 	else if(stream_connection->session->connect_info.enable_padspk)
 	{
 		CHIAKI_LOGI(stream_connection->log,
-			"StreamConnection not advertising padspk channels (service_type=%s, takion version %u, mix_to_main=%s, sink=%s)",
+			"StreamConnection not advertising padspk channels (service_type=%s, takion version %u lacks the padspk feature, mix_to_main=%s, sink=%s)",
 			chiaki_service_type_string(stream_connection->session->service_type),
 			(unsigned int)stream_connection->takion.version,
 			stream_connection->session->connect_info.padspk_mix_to_main ? "true" : "false",

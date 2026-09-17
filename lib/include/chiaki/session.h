@@ -85,11 +85,9 @@ typedef struct chiaki_connect_info_t
 	/**
 	 * Ask the host for the per-controller pad speaker lanes (padspk).
 	 *
-	 * Only honoured on PS Cloud: retail Remote Play never allocates a consumer for
-	 * these channels. The host also refuses them unless the negotiated Takion
-	 * protocol version is in [CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MIN,
-	 * CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MAX] and it is not mixing pad audio
-	 * into the main output.
+	 * Only honoured on PS Cloud. The host also refuses the channels unless the
+	 * negotiated Takion protocol version carries CHIAKI_TAKION_FEATURE_PADSPK and it
+	 * is not mixing pad audio into the main output.
 	 */
 	bool enable_padspk;
 	/**

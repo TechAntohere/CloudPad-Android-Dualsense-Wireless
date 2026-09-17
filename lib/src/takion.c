@@ -1940,6 +1940,27 @@ static ChiakiErrorCode av_packet_parse(bool v12, ChiakiTakionAVPacket *packet, C
 	return CHIAKI_ERR_SUCCESS;
 }
 
+CHIAKI_EXPORT bool chiaki_takion_protocol_feature_supported(uint8_t version, ChiakiTakionFeature feature)
+{
+	if(version < CHIAKI_TAKION_PROTOCOL_VERSION_MIN || version > CHIAKI_TAKION_PROTOCOL_VERSION_MAX)
+		return false;
+
+	// Feature count per protocol version, indexed by version - 9. A feature is
+	// available when its id is below the count for the negotiated version.
+	static const uint8_t feature_count[] = { 5, 6, 7, 8, 8, 8, 13, 13, 13, 16, 17, 19 };
+	// Versions 10 through 12 additionally mask out some ids below their own count,
+	// so the count alone is not sufficient for them. 0 means "no extra mask".
+	static const uint8_t low_mask[] = { 0, 0x2f, 0x5f, 0xdf, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+	size_t idx = (size_t)(version - CHIAKI_TAKION_PROTOCOL_VERSION_MIN);
+	unsigned f = (unsigned)feature;
+	if(f >= feature_count[idx])
+		return false;
+	if(low_mask[idx] && !((low_mask[idx] >> f) & 1))
+		return false;
+	return true;
+}
+
 CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_v9_av_packet_parse(ChiakiTakionAVPacket *packet, ChiakiKeyState *key_state, uint8_t *buf, size_t buf_size)
 {
 	return av_packet_parse(false, packet, key_state, buf, buf_size);

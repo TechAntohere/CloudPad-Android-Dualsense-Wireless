@@ -20,6 +20,9 @@ extern "C" {
 
 typedef struct chiaki_session_t ChiakiSession;
 
+/** Largest AUDIOSTATE payload blob this code will send. */
+#define CHIAKI_STREAM_CONNECTION_AUDIO_STATE_MAX_SIZE 64
+
 typedef enum chiaki_dualsense_effect_intensity_t
 {
 	Off = 0,
@@ -85,6 +88,19 @@ typedef struct chiaki_stream_connection_t
 } ChiakiStreamConnection;
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnection *stream_connection, ChiakiSession *session, double packet_loss_max);
+/**
+ * Send an AUDIOSTATE message to the host (see the implementation for what gates it).
+ *
+ * Nothing in this tree drives it yet: the message is gated on the same protocol
+ * feature as the padspk channels, and the layout of the per-type payload blob has not
+ * been established, so there is no correct blob to send from here. It exists because
+ * it is the only channel through which a client can tell the host an audio port or
+ * channel is live, which is what the host is waiting for before it feeds one.
+ */
+CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_send_audio_state(
+		ChiakiStreamConnection *stream_connection,
+		uint32_t audio_state_type, const uint8_t *data, size_t data_size);
+
 CHIAKI_EXPORT void chiaki_stream_connection_fini(ChiakiStreamConnection *stream_connection);
 
 /**

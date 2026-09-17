@@ -267,19 +267,46 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *
 CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_v9_av_packet_parse(ChiakiTakionAVPacket *packet, ChiakiKeyState *key_state, uint8_t *buf, size_t buf_size);
 
 /**
- * Takion protocol versions for which the host will declare and accept the padspk
- * audio channels. Outside this range the audio-settings path that carries them is
- * never reached, so advertising them has no effect.
+ * Takion protocol feature ids.
  *
- * The host decides this from a per-version feature-capability table: each protocol
- * version carries a feature count, and the padspk lanes are feature 10. The counts
- * are 5, 6, 7, 8, 8, 8, 13, 13, 13, 16, 17, 19 for versions 9 through 20, so
- * feature 10 first becomes available at version 15. (Haptics is feature 7, which is
- * why it already works at version 12.) The table is bounded at version 20 -- a
- * version above that is rejected outright rather than treated as newer.
+ * Both ends gate optional behaviour through one shared predicate: each protocol
+ * version carries a feature count, and a feature is available when its id is below
+ * that count. The counts are 5, 6, 7, 8, 8, 8, 13, 13, 13, 16, 17, 19 for versions 9
+ * through 20 (versions 10-12 additionally mask out a couple of low ids), and a
+ * version above 20 is rejected outright rather than treated as newer.
+ *
+ * Only the ids this code needs are named. The two that matter for the pad speaker:
+ * PADSPK gates both the padspk channel declarations and the entire AUDIOSTATE
+ * message, and AUDIO_CHANNELNUM gates the CHANNELNUM variant of it specifically.
  */
-#define CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MIN 15
-#define CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MAX 20
+typedef enum chiaki_takion_feature_t
+{
+	/** Haptics channels. Available from version 12, which is why they already work. */
+	CHIAKI_TAKION_FEATURE_HAPTIC = 7,
+	/**
+	 * Pad speaker channels, and with them the whole AUDIOSTATE message -- the host
+	 * refuses to accept any audio state update without this feature, so a session
+	 * that lacks it can have the padspk channels allocated and still never be able to
+	 * ask for them to be fed. Available from version 15.
+	 */
+	CHIAKI_TAKION_FEATURE_PADSPK = 10,
+	/** AUDIOSTATE type CHANNELNUM. Available from version 18. */
+	CHIAKI_TAKION_FEATURE_AUDIO_CHANNELNUM = 15,
+	/**
+	 * An audio port mask wider than 8 bits. Without it the client clamps the mask it
+	 * sends to 0xff. Available from version 19.
+	 */
+	CHIAKI_TAKION_FEATURE_AUDIO_WIDE_PORT_MASK = 16,
+} ChiakiTakionFeature;
+
+/** Lowest protocol version carrying any feature table at all. */
+#define CHIAKI_TAKION_PROTOCOL_VERSION_MIN 9
+
+/**
+ * Whether a Takion protocol version carries a given feature, by the same table both
+ * ends of the connection use. Versions outside [9, 20] carry nothing.
+ */
+CHIAKI_EXPORT bool chiaki_takion_protocol_feature_supported(uint8_t version, ChiakiTakionFeature feature);
 
 /** Takion protocol version whose feature table the host caps out at. */
 #define CHIAKI_TAKION_PROTOCOL_VERSION_MAX 20

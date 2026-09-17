@@ -34,7 +34,11 @@ typedef struct chiaki_audio_sink_t
 } ChiakiAudioSink;
 
 /**
- * Sink that receives raw pad speaker PCM (mono s16 48 kHz), tagged with a controller index.
+ * Sink that receives one controller's pad speaker lane, tagged with a controller index.
+ *
+ * Frames are Opus (mono, 48 kHz, 480 samples per frame) and still need decoding --
+ * the host declares this lane with isRawPcm false, unlike the haptics lane, which is
+ * raw PCM and reaches its sink ready to use.
  */
 typedef struct chiaki_pad_speaker_sink_t
 {

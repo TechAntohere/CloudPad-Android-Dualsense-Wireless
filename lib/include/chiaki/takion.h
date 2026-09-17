@@ -270,9 +270,41 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_v9_av_packet_parse(ChiakiTakionAVPac
  * Takion protocol versions for which the host will declare and accept the padspk
  * audio channels. Outside this range the audio-settings path that carries them is
  * never reached, so advertising them has no effect.
+ *
+ * The host decides this from a per-version feature-capability table: each protocol
+ * version carries a feature count, and the padspk lanes are feature 10. The counts
+ * are 5, 6, 7, 8, 8, 8, 13, 13, 13, 16, 17, 19 for versions 9 through 20, so
+ * feature 10 first becomes available at version 15. (Haptics is feature 7, which is
+ * why it already works at version 12.) The table is bounded at version 20 -- a
+ * version above that is rejected outright rather than treated as newer.
  */
 #define CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MIN 15
 #define CHIAKI_TAKION_PADSPK_PROTOCOL_VERSION_MAX 20
+
+/** Takion protocol version whose feature table the host caps out at. */
+#define CHIAKI_TAKION_PROTOCOL_VERSION_MAX 20
+
+/**
+ * AV header sizes per Takion protocol version, as the host's own lookup tables give
+ * them. Indexed by version - 9, i.e. entry 0 is version 9 and entry 11 is version 20.
+ *
+ * Versions 9 and 12 agree with the CHIAKI_TAKION_V9_/V12_ constants below, which is
+ * what makes the rest of the row trustworthy:
+ *
+ *   version : 9   10  11  12  13  14  15  16  17  18  19  20
+ *   base    : 11  11  11  11  11  11  11  11  11  11  11  19
+ *   audio   : 18  18  19  19  19  19  20  20  20  20  20  28
+ *   video   : 23  23  23  23  23  23  23  23  23  23  23  31
+ *
+ * Reading that: versions 15-19 differ from version 12 by exactly one extra byte, and
+ * it is in the audio-specific part of the header -- base and video are unchanged.
+ * Version 20 instead adds 8 bytes to the common prefix, which is why audio and video
+ * both grow by 8 on top of that.
+ */
+#define CHIAKI_TAKION_AV_HEADER_SIZE_TABLE_FIRST_VERSION 9
+#define CHIAKI_TAKION_AV_HEADER_SIZE_BASE_TABLE  { 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 19 }
+#define CHIAKI_TAKION_AV_HEADER_SIZE_AUDIO_TABLE { 18, 18, 19, 19, 19, 19, 20, 20, 20, 20, 20, 28 }
+#define CHIAKI_TAKION_AV_HEADER_SIZE_VIDEO_TABLE { 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 31 }
 
 #define CHIAKI_TAKION_V12_AV_HEADER_SIZE_VIDEO 0x17
 #define CHIAKI_TAKION_V12_AV_HEADER_SIZE_AUDIO 0x13

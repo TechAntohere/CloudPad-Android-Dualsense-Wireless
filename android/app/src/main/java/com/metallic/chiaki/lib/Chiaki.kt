@@ -596,7 +596,10 @@ data class HapticsFrameEvent(val data: ByteArray, val nativeElapsedRealtimeNs: L
 }
 
 /**
- * One frame of a controller's pad speaker lane: raw mono signed 16 bit 48 kHz PCM.
+ * One frame of a controller's pad speaker lane, as mono signed 16 bit 48 kHz PCM.
+ *
+ * The lane itself is Opus on the wire; the native side decodes it so this only ever
+ * carries PCM.
  *
  * [controllerIndex] is the local pad the lane belongs to (0-3); the host runs one
  * padspk channel per controller. [nativeElapsedRealtimeNs] is CLOCK_BOOTTIME sampled

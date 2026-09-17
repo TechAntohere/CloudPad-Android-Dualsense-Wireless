@@ -44,11 +44,30 @@ extern "C" {
 /** Local controllers a Takion session can carry, and so the number of haptic/padspk channels each. */
 #define CHIAKI_AUDIO_CHANNEL_CONTROLLERS_MAX 4
 
-/** Pad speaker lane format: mono signed 16 bit 48 kHz, 480 samples (10 ms) per frame. */
-#define CHIAKI_AUDIO_PADSPK_CHANNELS    1
-#define CHIAKI_AUDIO_PADSPK_BITS        16
-#define CHIAKI_AUDIO_PADSPK_RATE        48000
-#define CHIAKI_AUDIO_PADSPK_FRAME_SIZE  480
+/**
+ * Lane formats exactly as the host declares them.
+ *
+ * padspk: mono, 16 bit, 48 kHz, 480 samples (10 ms) per frame, 960 bytes decoded,
+ *         Opus at roughly 48 kbps -- the host declares it with isRawPcm false.
+ * haptic: stereo, 16 bit, 3 kHz, 30 samples per frame, 120 bytes, isRawPcm true.
+ *         That 120 is why the haptics sink can memcpy int16 samples straight out.
+ *
+ * So the two per-controller lanes are not alike: haptics arrives as PCM and pad
+ * speaker arrives as Opus, and needs decoding before it can be played.
+ */
+#define CHIAKI_AUDIO_PADSPK_CHANNELS      1
+#define CHIAKI_AUDIO_PADSPK_BITS          16
+#define CHIAKI_AUDIO_PADSPK_RATE          48000
+#define CHIAKI_AUDIO_PADSPK_FRAME_SIZE    480
+#define CHIAKI_AUDIO_PADSPK_IS_RAW_PCM    false
+#define CHIAKI_AUDIO_PADSPK_MAX_FRAME_SZ  (CHIAKI_AUDIO_PADSPK_FRAME_SIZE * CHIAKI_AUDIO_PADSPK_CHANNELS * 2)
+
+#define CHIAKI_AUDIO_HAPTIC_CHANNELS      2
+#define CHIAKI_AUDIO_HAPTIC_BITS          16
+#define CHIAKI_AUDIO_HAPTIC_RATE          3000
+#define CHIAKI_AUDIO_HAPTIC_FRAME_SIZE    30
+#define CHIAKI_AUDIO_HAPTIC_IS_RAW_PCM    true
+#define CHIAKI_AUDIO_HAPTIC_MAX_FRAME_SZ  (CHIAKI_AUDIO_HAPTIC_FRAME_SIZE * CHIAKI_AUDIO_HAPTIC_CHANNELS * 2)
 
 static inline bool chiaki_audio_channel_is_haptic(uint8_t channel)
 {

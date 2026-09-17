@@ -1301,10 +1301,14 @@ static bool pb_encode_padspk_channels(pb_ostream_t *stream, const pb_field_t *fi
 		channel.audio_header.arg = &audio_header_buf;
 		channel.audio_header.funcs.encode = chiaki_pb_encode_buf;
 
-		// The pad speaker lane is uncompressed: the frames arrive as interleavable
-		// mono s16 samples, exactly like the haptics lane, not as Opus packets.
+		// Unlike the haptics lane, padspk is compressed: the host declares it with
+		// isRawPcm false and a ~48 kbps budget, i.e. Opus. (Haptics is the raw one --
+		// 3 kHz stereo, 120 bytes per frame, which is why it reaches its sink as PCM.)
 		channel.has_is_raw_pcm = true;
-		channel.is_raw_pcm = true;
+		channel.is_raw_pcm = false;
+
+		// Leave fec_mode unset so the host applies its own default for the lane.
+		channel.has_fec_mode = false;
 
 		if(!pb_encode_tag_for_field(stream, field))
 			return false;
@@ -1355,7 +1359,7 @@ static ChiakiErrorCode stream_connection_enable_microphone(ChiakiStreamConnectio
 		msg.stream_info_payload.audio_channel.funcs.encode = pb_encode_padspk_channels;
 
 		CHIAKI_LOGI(stream_connection->log,
-			"StreamConnection advertising %zu padspk channels (ids %u-%u, %uch/%ubit/%uHz/%u samples, raw pcm)",
+			"StreamConnection advertising %zu padspk channels (ids %u-%u, %uch/%ubit/%uHz/%u samples, opus)",
 			padspk_ctx.count,
 			(unsigned int)chiaki_audio_channel_padspk(0),
 			(unsigned int)chiaki_audio_channel_padspk((uint8_t)(padspk_ctx.count - 1)),

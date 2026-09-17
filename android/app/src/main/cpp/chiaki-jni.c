@@ -13,6 +13,7 @@
 #include <chiaki/remote/holepunch.h>
 #include <chiaki/base64.h>
 #include <chiaki/opusencoder.h>
+#include <opus/opus.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -224,6 +225,10 @@ typedef struct android_chiaki_session_t
 	uint32_t haptics_frames_dropped_small;
 	uint32_t padspk_frames_received;
 	uint32_t padspk_frames_dropped_small;
+	uint32_t padspk_frames_decode_failed;
+	// One mono Opus decoder per controller: the padspk lanes are independent streams
+	// and must not share decoder state.
+	OpusDecoder *padspk_decoders[CHIAKI_AUDIO_CHANNEL_CONTROLLERS_MAX];
 	// Cached class refs for CHIAKI_EVENT_REGIST (FindClass doesn't work from native threads)
 	jclass java_target_class;
 	jmethodID java_target_from_value;
@@ -415,10 +420,11 @@ static void android_chiaki_padspk_frame(uint8_t controller_index, uint8_t *buf, 
 	int64_t native_elapsed_realtime_ns = android_chiaki_elapsed_realtime_nanos();
 	if(!buf || !buf_size)
 		return;
+	if(controller_index >= CHIAKI_AUDIO_CHANNEL_CONTROLLERS_MAX)
+		return;
 
 	session->padspk_frames_received++;
-	// A frame below one whole sample carries no waveform; drop it but keep it visible.
-	if(buf_size < sizeof(int16_t))
+	if(buf_size < 2)
 	{
 		session->padspk_frames_dropped_small++;
 		if(session->padspk_frames_dropped_small <= 8 || session->padspk_frames_dropped_small % 64 == 0)
@@ -430,18 +436,55 @@ static void android_chiaki_padspk_frame(uint8_t controller_index, uint8_t *buf, 
 		return;
 	}
 
+	// The lane is Opus, not PCM -- unlike haptics. Decode here so Kotlin only ever
+	// sees mono s16 and does not need a decoder of its own.
+	OpusDecoder *decoder = session->padspk_decoders[controller_index];
+	if(!decoder)
+	{
+		int opus_err = 0;
+		decoder = opus_decoder_create(CHIAKI_AUDIO_PADSPK_RATE, CHIAKI_AUDIO_PADSPK_CHANNELS, &opus_err);
+		if(!decoder || opus_err != OPUS_OK)
+		{
+			if(decoder)
+				opus_decoder_destroy(decoder);
+			CHIAKI_LOGE(session->log, "JNI failed to create padspk Opus decoder for pad %u: %s",
+				(unsigned int)controller_index, opus_strerror(opus_err));
+			return;
+		}
+		session->padspk_decoders[controller_index] = decoder;
+		CHIAKI_LOGI(session->log, "JNI created padspk Opus decoder for pad %u (%u ch, %u Hz)",
+			(unsigned int)controller_index,
+			(unsigned int)CHIAKI_AUDIO_PADSPK_CHANNELS, (unsigned int)CHIAKI_AUDIO_PADSPK_RATE);
+	}
+
+	int16_t pcm[CHIAKI_AUDIO_PADSPK_FRAME_SIZE * CHIAKI_AUDIO_PADSPK_CHANNELS];
+	int samples = opus_decode(decoder, buf, (opus_int32)buf_size, pcm, CHIAKI_AUDIO_PADSPK_FRAME_SIZE, 0);
+	if(samples <= 0)
+	{
+		session->padspk_frames_decode_failed++;
+		if(session->padspk_frames_decode_failed <= 8 || session->padspk_frames_decode_failed % 64 == 0)
+		{
+			CHIAKI_LOGW(session->log, "JNI padspk Opus decode failed on pad %u (#%u): %s",
+				(unsigned int)controller_index,
+				(unsigned int)session->padspk_frames_decode_failed,
+				opus_strerror(samples));
+		}
+		return;
+	}
+
 	if(session->padspk_frames_received <= 8 || session->padspk_frames_received % 256 == 0)
 	{
-		CHIAKI_LOGI(session->log, "JNI live padspk frame #%u pad=%u size=%llu",
+		CHIAKI_LOGI(session->log, "JNI live padspk frame #%u pad=%u opus=%llu bytes -> %d samples",
 			(unsigned int)session->padspk_frames_received,
 			(unsigned int)controller_index,
-			(unsigned long long)buf_size);
+			(unsigned long long)buf_size, samples);
 	}
 
 	JNIEnv *env = attach_thread_jni();
 	if(!env)
 		return;
-	jbyteArray data = jnibytearray_create(env, buf, buf_size);
+	jbyteArray data = jnibytearray_create(env, (const uint8_t *)pcm,
+		(size_t)samples * CHIAKI_AUDIO_PADSPK_CHANNELS * sizeof(int16_t));
 	E->CallVoidMethod(env, session->java_session,
 					  session->java_session_event_padspk_frame_meth,
 					  (jint)controller_index,
@@ -449,6 +492,18 @@ static void android_chiaki_padspk_frame(uint8_t controller_index, uint8_t *buf, 
 					  (jlong)native_elapsed_realtime_ns);
 	E->DeleteLocalRef(env, data);
 	(*global_vm)->DetachCurrentThread(global_vm);
+}
+
+static void android_chiaki_padspk_decoders_fini(AndroidChiakiSession *session)
+{
+	for(size_t i = 0; i < CHIAKI_AUDIO_CHANNEL_CONTROLLERS_MAX; i++)
+	{
+		if(session->padspk_decoders[i])
+		{
+			opus_decoder_destroy(session->padspk_decoders[i]);
+			session->padspk_decoders[i] = NULL;
+		}
+	}
 }
 
 static void android_chiaki_event_cb(ChiakiEvent *event, void *user)
@@ -991,6 +1046,7 @@ JNIEXPORT void JNICALL JNI_FCN(sessionFree)(JNIEnv *env, jobject obj, jlong ptr)
 	CHIAKI_LOGI(session->log, "Shutting down JNI Session");
 	chiaki_opus_encoder_fini(&session->opus_encoder);
 	chiaki_session_fini(&session->session);
+	android_chiaki_padspk_decoders_fini(session);
 	android_chiaki_video_decoder_fini(&session->video_decoder);
 	if(session->use_opus_decoder)
 		android_chiaki_opus_decoder_fini(&session->opus_decoder);

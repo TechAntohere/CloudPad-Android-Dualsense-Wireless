@@ -555,34 +555,53 @@ main instead, which is why both the user-facing behaviour and the gate agree.
 
 ### The `audioSettings` schema
 
-The parser at `0x28e0xx`-`0x28f1xx` gives the exact shape the host accepts. Keys, in the
-order they are parsed:
+The parser at `0x28e0xx`-`0x28f1xx` gives the exact shape the host accepts. `settings` is
+an **array**, not an object: `0x1780e0` returns its length, `0x178100(container, i)` gets
+element `i`, and the loop at `0x28efc0` walks it. Per element the parser first stamps a
+default template from `0x4f02a0` — sampleRate 48000, channels 2, samplesPerFrame 480,
+bitrate 64, i.e. the `main` lane's values — and each present key overrides one field.
+
+This block is known to work: it is what allocated all four lanes, padspk included.
 
 ```json
 "audioSettings": {
   "mixToMain": false,
   "audioChannels": [
-    {
-      "name": "padspk",
-      "fecMode": <int>,
-      "settings": {
-        "channels": 1,
-        "sampleRate": 48000,
-        "samplesPerFrame": 480,
-        "bitrate": <int>,
-        "profileEnumType": <int>,
-        "isRawPcm": false
-      }
-    }
+    { "name": "main",   "fecMode": 2,
+      "settings": [{ "channels": 2, "sampleRate": 48000, "samplesPerFrame": 480,
+                     "bitrate": 64, "isRawPcm": false, "profileEnumType": 0 }] },
+    { "name": "voice",  "fecMode": 2,
+      "settings": [{ "channels": 1, "sampleRate": 48000, "samplesPerFrame": 480,
+                     "bitrate": 48, "isRawPcm": false, "profileEnumType": 0 }] },
+    { "name": "haptic", "fecMode": 2,
+      "settings": [{ "channels": 2, "sampleRate": 3000,  "samplesPerFrame": 30,
+                     "bitrate": 96, "isRawPcm": true,  "profileEnumType": 0 }] },
+    { "name": "padspk", "fecMode": 2,
+      "settings": [{ "channels": 1, "sampleRate": 48000, "samplesPerFrame": 480,
+                     "bitrate": 48, "isRawPcm": false, "profileEnumType": 0 }] }
   ]
 }
 ```
 
+Three things this settles:
+
+- **padspk is voice, field for field.** 1 channel, 48 kHz, 480 samples, 48 kbps, Opus.
+  Only the name differs. Anything that already builds a voice lane builds a padspk lane.
+- **It confirms `declareChannel` independently.** The bitrates here (96 haptic, 48 padspk)
+  and the rates and frame sizes are the same numbers §1 read out of `0x21d5a0`, arrived at
+  from the other direction.
+- **`fecMode: 2` is accepted for all four**, padspk included, so the lane needs no special
+  FEC handling.
+
 `name` takes the same four literals as the host's own table at `0x53b2a8` (main, voice,
 padspk, haptic — stride `0x20`, matching the cloud-constants table at `0x53a8a8` in §10
 entry for entry). `isRawPcm` and `fecMode` line up with the `AudioChannelPayload` fields
-already added to `takion.proto`, and the settings block matches the padspk lane format in
-§1 exactly.
+already added to `takion.proto`.
+
+Worth being plain about what this block does and does not do. It gets the channels
+**allocated** — the host accepts the declaration and builds four per-controller objects
+(§7). It does not get them **fed**; that is the missing AvCap consumer, and no value in
+this JSON reaches it.
 
 ---
 

@@ -547,9 +547,55 @@ this and bounded the rest:
   post-processes them. What the module does give is their *rules* (bit 0 implies bit 1;
   voice plus bit 2 forces the low three bits to 3).
 
-So the remaining sources for the constants are an SDK header, or `orbis_audiod` /
-`libSceAudioSystem` on the daemon side of that IPC. A genstub `.c` is no use here: those
-carry NID -> name mappings only, no `#define`, `enum` or `struct`.
+### Where the daemon actually is
+
+Worth being precise, because it is easy to get wrong: `orbis_audiod.elf`
+(`/system/sys/`) is **not** the daemon. It is a 1884-byte bootstrap whose whole job is
+to load MBUS, HMD2, AJM and IPMI and then
+`/system/priv/lib/libSceAudioSystem.sprx` — which is the real implementation, and which
+*is* in the dump at 816 KB.
+
+The port state does not travel by IPC either. libSceAudioOut reads it out of **shared
+memory** under a spinlock (`lock cmpxchg` on `port+0x48`), so both sides of the struct
+are in reach in principle.
+
+The composer chain on the read side is `sceAudioOutGetPortState` -> `0x186c0` (a two
+instruction thunk) -> `0x18320` -> `0x211b0`. `0x18320` holds the interesting part:
+
+```c
+if (port->+0x754) state.output &= 0x7f;          // bit 7 cleared conditionally
+if (port->volume /*float at +0x554*/ == 0.0f) {
+    switch (port->type /*+0x00*/) {
+      case 2:  /* VOICE  */
+      case 4:  /* PADSPK */ ... same branch ...
+      case 3:  /* PERSONAL, and only when output bit 2 is clear */ ...
+    }
+}
+```
+
+So voice and pad speaker are handled as a pair at zero volume, distinct from personal,
+which additionally tests output bit 2 — more evidence that the low output bits encode a
+destination and that type 4 is a real routing case.
+
+Partial shm port object map, from the read side: type at `+0x00`, volume (float) at
+`+0x554`, a dword at `+0x550`, `+0x4a8`, floats at `+0x470`/`+0x474`, a dword at
+`+0x478`, flags at `+0x730`/`+0x734`/`+0x754`. libSceAudioOut also has a generic
+parameter getter at `0x186d0` with a 33-entry jump table mapping parameter ids onto
+those fields — an enumerable API surface if it is ever needed.
+
+The daemon side additionally exposes `sceAudioOutConnectRemote` /
+`sceAudioOutDisconnectRemote`, `sceAudioOutConnectShare` and
+`sceAudioOutServerBusConnect` / `BusDisconnect` — explicit attach points for remote play
+audio, which is where a cloud host would hook a bus up.
+
+What is still not pinned is the naming of each output bit. Matching the writer side in
+libSceAudioSystem by raw field offset does not work, because the daemon indexes the same
+shm with a different base and stride; finding it means following its own port table
+rather than grepping offsets. That is the next thread to pull if the values are wanted
+exactly rather than by experiment.
+
+A genstub `.c` is no use for any of this: those carry NID -> name mappings only, no
+`#define`, `enum` or `struct`.
 - **Brute-force.** `output` is 16 bits with few meaningful values, `volume` is obvious,
   `flag`'s low half is likely small. The host gives a clean per-attempt yes/no, and no
   capture decryption is needed. Practical now that the search space is three named fields

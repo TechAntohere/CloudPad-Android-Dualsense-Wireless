@@ -138,6 +138,13 @@ static inline bool chiaki_audio_out_port_type_valid(unsigned type)
  */
 #define CHIAKI_AUDIO_OUT_VOLUME_NOT_REPORTED 0xffff
 
+/**
+ * Output destination mask value meaning "nothing attached". The module treats a port
+ * with this as inactive and zeroes the rest of its state to match, so it is the one
+ * value a live pad speaker port certainly does not carry.
+ */
+#define CHIAKI_AUDIO_OUT_OUTPUT_NONE 0
+
 static inline uint8_t chiaki_audio_channel_out_port_type(uint8_t channel)
 {
 	if(channel == CHIAKI_AUDIO_CHANNEL_VOICE)

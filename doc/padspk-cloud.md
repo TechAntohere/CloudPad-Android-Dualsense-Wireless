@@ -410,6 +410,30 @@ and a voice port with bit 2 set has its low three bits forced to 3. The values
 themselves originate in the audio daemon over IPC, so the module gives the rules but not
 the enum.
 
+The module's *other* consumers of the same fetch give more. `sceAudioOut2PortGetState`
+and its neighbours share the struct, and between them establish:
+
+- **`output == 0` means the port is not live.** Wherever the module decides a port has
+  nothing attached it writes `output = 0` and zeroes `channel` and `flag` to match. So a
+  pad speaker port that is actually feeding must carry a non-zero `output` — recorded as
+  `CHIAKI_AUDIO_OUT_OUTPUT_NONE`.
+- **bit 7 is real**, and gets masked back off unless the freshly fetched state has it.
+- **`channel` is a channel count, not an index.** Values 2, 8 and 12 all appear, with 12
+  downgraded to 8 when a capability is missing — so 7.1.4 falling back to 7.1.
+- **`flag` bit 0 is meaningful**, cleared for the stereo case.
+
+Together with the volume rule, that is most of what a synthesised PORTSTATES entry needs
+to look plausible: non-zero `output`, a sane `channel` count, a real `volume`, and `flag`
+low bit set or clear to taste. What is still unnamed is which destination each `output`
+bit denotes.
+
+Other things the module settles, for the record: `sceAudioOutSetPadSpkVolume` and
+`sceAudioOutSetPadJackVolume` exist as dedicated exports (IPMI method `0x4c`), so the pad
+speaker has its own volume path end to end; and the audio system's internal bus name
+table (in `libSceAudioSystem`, 50 entries of `{name, slot, 8}` at `0xa34340`) lists
+`PADSPK` and `VOICE(PADSPK)` as distinct buses alongside `TV`, `HP0..HP3`, `REC` and
+`REMOTE_PLAY` — the last being an explicit remote-play destination.
+
 Port table internals, if needed again: base `0x6cf98`, stride `0x1040`, port type at
 `+0x1020`, refcount at `+0x102c`, a disable bit at `+0x103a & 0x40`.
 

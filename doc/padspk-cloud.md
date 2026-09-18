@@ -456,9 +456,16 @@ factory pointer (`this->+0x17c0`) is touched **exactly seven times in the whole 
 
 Three creates. **Slot `+0x430` — the one the host's own padspk capture section reads at
 `0x22288a` — has no creator anywhere.** Everything else for the lane is present: format
-declaration, capture thread section (`AvCap audioThread padspk`), the `mixToMain` fork,
-per-channel active flags, error logging. There are init-failure strings for `haptic`,
-`video` and `audio` and none for padspk, because there is no init to fail.
+declaration, channel acceptance (both gates, below), four per-controller channel objects,
+capture thread section (`AvCap audioThread padspk`), the `mixToMain` fork, per-channel
+active flags, error logging. There are init-failure strings for `haptic`, `video` and
+`audio` and none for padspk, because there is no init to fail.
+
+Keep the two layers apart, because they answer different questions. *Channel acceptance*
+— does the host agree to the lane — is complete and gated only by the two conditions
+below. *Feeding* — does anything ever put audio into it — is the missing consumer. The
+lane is allocated and then starved, which is the behaviour this whole document started
+from.
 
 Supporting detail: the retail host has **no log strings for handling audio state at all**,
 only the protobuf descriptor entries that come free with the shared schema — consistent
@@ -474,20 +481,108 @@ and the cloud-mode branch is where the missing construction would live.
 There is also a second, lesser blocker: feature 10 needs v15+, and remote play negotiates
 v12 (`streamconnection.c:276`).
 
-### The `mixToMain` gate
+### The two gates, read out of the host
 
-Host-side, at `0x222a1f`, immediately before the padspk section:
+The missing consumer is the *feed* layer. One layer up — whether the host accepts a
+declared `padspk` channel at all — is fully implemented, and both gates the lane passes
+through sit in one basic block inside the AvCap setup function `0x21b810`:
 
 ```
-cmp byte [rbx + r13 + 0x1810], 1   ; per-channel active flag
-jne skip
-cmp byte [rbx + 0x214], 1          ; mixToMain?
-jne separate_lane                  ; not mixing -> padspk gets its own lane
-... fold mono pad audio into the stereo main mix ...
+0x21becf  capability(6,  version)            ; feature 6, else main-only fallback
+0x21bf0a  cmp dword [rbp-0x110], 0xa         ; channel id 10 == COUNT -> reject
+0x21bf17  cmp byte [r13 + 0x214], 1          ; mixToMain?
+            yes -> name == "voice"  -> 0x21c611 : set [r13+0x1895]=1, reject
+                   name == "padspk" -> 0x21c57b : reject
+0x21bfdc  capability(10, version)            ; feature 10 = padspk
+            false and name == "padspk" -> 0x21c574 : reject
+            true                        -> 0x21c040 : accept
 ```
 
-`mixToMain` comes from the host's `audioSettings` JSON (parsed at `0x28ec8a`). When true
-the pad audio is already in the main mix, so asking for the lane as well would double it.
+So the two conditions are exactly `mixToMain == false` **and** `capability(10, version)`,
+and nothing else stands between a declared padspk channel and acceptance. `capability` is
+the same predicate as the client's (`0x169910` host, `0x2511f0` client), so feature 10
+means protocol v15+ by the table in §2.
+
+A sweep of every `capability()` call site in the host — 64 of them — shows feature `0xa`
+queried exactly once, at `0x21bfdc`. There is no second padspk gate hiding elsewhere.
+
+### padspk and haptic are the same code path
+
+Past the gates, the accepted channel reaches `0x21c260`, and this is the part worth
+keeping:
+
+```
+0x21c252  cl = (name == "padspk")
+0x21c25b  cl = 1                     ; reached when name == "haptic"
+0x21c26d  [rbp-0x164] = cl           ; "this lane is per-controller"
+0x21c26a  r13d = 0
+          ... build one 0x40-byte channel object, register via 0x228210 ...
+0x21c2ec  cmp r13d, 3
+0x21c2f0  r13d++
+0x21c2f8  cl = (old r13d < 3)
+0x21c2fb  test [rbp-0x164], cl
+0x21c301  je exit
+```
+
+The loop runs **four times for haptic and for padspk, once for everything else**. The host
+builds one channel object per local controller for both lanes, from identical code. That
+is the four-controller model of §1 confirmed on the host side, and it means padspk is not
+a degraded or half-wired variant of haptic — at this layer it *is* haptic's code.
+
+The per-channel object also gets `[r12+0x38] = !(haptic || padspk)`, a flag set only for
+main, voice and video. Its use is not yet traced; `mixToMain`-adjacent is the obvious
+guess and is not more than a guess.
+
+### What `mixToMain` actually does
+
+`+0x214` is `mixToMain`, and both ends of it are now pinned. It is written by the
+`audioSettings` parser and read by the mixer:
+
+```
+0x28ec71  mov byte [r15 + 0x214], 0     ; default false
+0x28eca9  "mixToMain"
+0x28ecde  mov byte [r15 + 0x214], al    ; from JSON
+...
+0x222a1f  cmp byte [rbx + 0x214], 1
+0x222a50  fold the mono lane into the stereo main buffer, saturating
+```
+
+The mixer body is unambiguous: `movsx` a 16-bit sample from the mono source, `vfmadd213ss`
+it into the stereo destination, `vmaxss`/`vminss` to clamp, store back. That is a mono
+pad lane being folded into main. So `mixToMain = true` is not merely "prefer the main
+mix" — it makes the host reject the separate lane at `0x21bf17` *and* mix the audio into
+main instead, which is why both the user-facing behaviour and the gate agree.
+
+### The `audioSettings` schema
+
+The parser at `0x28e0xx`-`0x28f1xx` gives the exact shape the host accepts. Keys, in the
+order they are parsed:
+
+```json
+"audioSettings": {
+  "mixToMain": false,
+  "audioChannels": [
+    {
+      "name": "padspk",
+      "fecMode": <int>,
+      "settings": {
+        "channels": 1,
+        "sampleRate": 48000,
+        "samplesPerFrame": 480,
+        "bitrate": <int>,
+        "profileEnumType": <int>,
+        "isRawPcm": false
+      }
+    }
+  ]
+}
+```
+
+`name` takes the same four literals as the host's own table at `0x53b2a8` (main, voice,
+padspk, haptic — stride `0x20`, matching the cloud-constants table at `0x53a8a8` in §10
+entry for entry). `isRawPcm` and `fecMode` line up with the `AudioChannelPayload` fields
+already added to `takion.proto`, and the settings block matches the padspk lane format in
+§1 exactly.
 
 ---
 
@@ -872,4 +967,8 @@ host    0x169910  feature predicate             0x21d5a0  declareChannel
         0x30150   Gaikai string destructor      0x53a8a8  lane-name array (0x20 stride)
         0x21c6ad/0x21c8ac  video consumer       0x21ca5d  main consumer
         0x21cb78  haptic consumer               (no site) padspk consumer
+        0x21b810  AvCap setup (owns both gates) 0x21bfdc  capability(10) gate
+        0x21bf17  mixToMain gate                0x21c260  per-controller channel loop
+        0x28eca9  "mixToMain" key               0x28ee0d  "audioChannels" key
+        0x222a1f  mono-into-main mixer          0x53b2a8  host lane-name table
 ```

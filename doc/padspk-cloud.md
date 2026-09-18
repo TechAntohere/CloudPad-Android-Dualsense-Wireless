@@ -906,6 +906,86 @@ None touch `+0x430`, `+0x17C0` or `+0x6DC`. Capability flags at `session+0x6DC` 
 single store, at `0x21B72D` inside `0x21B720`, which is vtable-dispatched with no static
 references.
 
+### What the client can actually send
+
+The client's own request builder is at `0x27810` in `gaikai-player.sprx`, and it writes the
+schema out key by key between `0x28136` and `0x28537`:
+
+```json
+{
+  "audioChannels": [
+    {
+      "name": "default",
+      "encoderType": "opus",
+      "audioChannelSettings": {
+        "audioChannelType":  <int>,
+        "isSigned":          <bool>,
+        "sampleRate":        <int>,
+        "sampleSize":        <int>,
+        "channels":          <int>,
+        "maxFrameDataSize":  <int>,
+        "samplesPerFrame":   <int>,
+        "bitrate":           <int>,
+        "isRawPcm":          <bool>,
+        "fecMode":           <int>
+      }
+    }
+  ],
+  "pauseModeRequested":  ...,
+  "numberOfSlices":      ...,
+  "disableRPEncryption": ...,
+  "handshakeKey":        ...
+}
+```
+
+Two things make this the interesting object rather than another config blob.
+
+**It is the host's channel struct, field for field.** Compare the 36-byte entry read out of
+`declareChannel` in §1:
+
+```
++0x00 audioChannelType     +0x14 channels
++0x04 (5)                  +0x18 maxFrameDataSize
++0x08 isSigned             +0x1c samplesPerFrame
++0x09 isRawPcm             +0x20 bitrate
++0x0c sampleRate
++0x10 sampleSize
+```
+
+Every field, same names, same order. `audioChannelSettings` is the wire form of that
+struct.
+
+**`audioChannelType` is the lane id itself.** Not a name to be mapped — the number. The
+host reads it at `0x205290`, inside the same normalizer `0x205040` that rebuilds
+`audioSettings`, and again at `0x1e5a0d`. So `0x1E69D0`'s name mapping
+(`padspk` -> `6+index`) and this numeric field are two ways into the same value space, and
+the client's request carries the numeric one.
+
+That closes the chain end to end:
+
+```
+client request  audioChannels[].audioChannelSettings.audioChannelType
+  -> allocator seals a launchspec                      <- the unknown link
+     -> host 0x205040 : drop audioSettings, rebuild from audioChannelSettings
+        (reads audioChannelType at 0x205290)
+        -> channel-name list at session+0x1D8
+        -> 0x21BC50 -> 0x1E69D0 -> 0x21D5A0
+        -> capability(10, version)
+        -> STREAMINFO lanes 6-9
+```
+
+So what to send is answerable precisely: four more `audioChannels` entries carrying
+`audioChannelType` 6, 7, 8, 9 with the padspk format from §1 — `channels` 1,
+`sampleRate` 48000, `samplesPerFrame` 480, `sampleSize` 2, `bitrate` 48, `isRawPcm` false,
+`encoderType` `"opus"`, `fecMode` 2.
+
+**What is not answerable from any binary here** is whether the allocator forwards
+client-supplied `audioChannelSettings` into the launchspec it seals, or overwrites it the
+way the local host's normalizer overwrites `audioSettings`. That decision runs at
+`cc.prod.gaikai.com` (§11) and exists in no file in the corpus. It is the one remaining
+link, and it is the allocator-side lever — testing it means sending the block and reading
+the STREAMINFO that comes back, not reading more firmware.
+
 ### Where that leaves the two transports
 
 | transport | grant (6-9 in STREAMINFO) | emission | status |
@@ -1440,4 +1520,6 @@ grant   session+0x1D8  channel-name list     0x21bc50  iterates it
         0x1783e0  JSON remove-member          0x52e590  factory vtable (zero in file)
 ctrl    0x4f30c8  CTRL jump table             0x36cd3   its dispatch
         0x36f69   type 0x11 platform ident    0x37066   type 0x13 DualSense feature
+        0x27810   client request builder      0x28136-0x28537  its schema keys
+        0x205290  host reads audioChannelType 0x1e5a0d  and again here
 ```

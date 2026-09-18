@@ -109,6 +109,26 @@ Counts for v9..v20: `5, 6, 7, 8, 8, 8, 13, 13, 13, 16, 17, 19`. Versions 10-12
 additionally mask out a few low ids (`0x2f`, `0x5f`, `0xdf`). **A version above 20 is
 rejected outright, not treated as newer** — so v23 gets nothing on this firmware.
 
+The host's version of the predicate decodes exactly. `0x169910` does
+`esi -= 9; if (esi > 0xb) return 0`, then jumps through a 12-entry table at `0x4f65f0`:
+
+| version | predicate | feature 7 (haptic) | feature 10 (padspk) |
+|---|---|---|---|
+| 9 | `feature < 5` | no | no |
+| 10 | mask `0x2f`, `feature < 6` | no | no |
+| 11 | mask `0x5f`, `feature < 7` | no | no |
+| 12 | mask `0xdf`, `feature < 8` | **yes** | no |
+| 13, 14 | `feature < 8` | yes | no |
+| 15, 16, 17 | `feature < 13` | yes | **yes** |
+| 18 | `feature < 16` | yes | yes |
+| 19 | `feature < 17` | yes | yes |
+| 20 | `feature < 19` | yes | yes |
+
+Read straight off the jump table, this is the whole story in one place: **haptic turns on
+at v12, padspk at v15.** Retail remote play negotiates v12. That is precisely why haptics
+works there today and padspk does not, and it is the 15-20 range confirmed rather than
+assumed.
+
 | feature | first version | what it gates |
 |---|---|---|
 | 6 | 11 | parsing the `audioChannel` list at all |
@@ -676,6 +696,21 @@ in `{5, 6, 7, 8}`, so both are dropped at `0x22fde0`. When the queue *is* full i
 **(B) rejects haptic**, as established above: `+0x38` is false for haptic and padspk, and
 `0x2239c0` returns at `0x223a97` without doing anything.
 
+The padspk block is the same code with two constants changed. At `0x22288a` it loads the
+consumer from `+0x430`, and:
+
+```
+0x222891  test rdi, rdi
+0x222894  je 0x22311a                      ; <-- where padspk dies on retail, every pass
+0x2228b0  call [consumer_vtable + 0x20]    ; readFrame, same slot as haptic
+0x2228bc  cmp dword [rbp-0x198], 3         ; frame type 3 (haptic checks 2)
+0x2228c9  require err >= 0
+```
+
+So the AvCap frame-type enum has 2 for haptic and 3 for pad speaker, the consumer
+interface is the same (`+0x20` is `readFrame` for both), and the single instruction that
+ends padspk on a retail host is the null test at `0x222891`.
+
 **So the frame leaves inside `readFrame`.** That is the only route left, and it fits
 everything else. `[consumer_vtable + 0x20]` is a virtual call on an object whose class is
 not in this binary (§ "Is there a voice consumer to repurpose?"), and the audio thread's
@@ -1156,4 +1191,6 @@ host    0x169910  feature predicate             0x21d5a0  declareChannel
         0x2258a0  setAvCapFactory (injected)    this+0x17e8  channel map
         0x22f8b0  StreamCollectorSender ctor    0x22fd80  its type-filtered push
         0x22faa7  accepted types {5,6,7,8}      0x2222cc  haptic readFrame (vtable+0x20)
+        0x2228b0  padspk readFrame              0x222891  the null test padspk dies on
+        0x4f65f0  capability jump table (12)    frame types: 2 haptic, 3 padspk
 ```

@@ -464,8 +464,12 @@ Supporting detail: the retail host has **no log strings for handling audio state
 only the protobuf descriptor entries that come free with the shared schema — consistent
 with AUDIOSTATE being acted on by the cloud server rather than this binary.
 
-The cloud server is a different, datacenter-side build, so none of this binds it. Cloud
-remains the only viable target.
+None of this binds the cloud side — but for a sharper reason than "different build".
+This same binary carries the cloud server's code paths (`cc.prod.gaikai.com`,
+`Received config from cloud.`) behind a `/etc/gaikai-release` check that only a
+datacenter unit passes; see §10. So the padspk consumer is absent from the *retail mode*
+of a binary that has the reader for it either way. Cloud remains the only viable target,
+and the cloud-mode branch is where the missing construction would live.
 
 There is also a second, lesser blocker: feature 10 needs v15+, and remote play negotiates
 v12 (`streamconnection.c:276`).
@@ -614,70 +618,195 @@ than failing silently.
 
 ---
 
-## 10. Firmware files still needed
+## 10. The cloud server is this same binary
 
-Read against the FTP listing of a live console (`ps5_filelist.txt`, 11 499 paths). Every
-path below was checked to exist in that listing, so each one is pullable as-is.
+Worth establishing before the file list, because it changes what is worth asking for.
 
-### Already in hand
+`NPXS40102/eboot.bin` is not "the remote play host, and cloud is something else". Its
+static-constants initialiser at `0x1e0910` sets up, in one block:
 
-For the record, so nothing gets re-pulled: `gaikai-player.sprx` (NPXS40074 and
-NPXS40099), `/system/vsh/app/NPXS40102/eboot.bin` (this is the remote play *host* --
-its build path reads `vsh/daemon/remoteplay_server/Prospero_Release/remoteplay_server.elf`,
-so it is the PS5 server despite the legacy-looking directory),
-`libScePSNowGkp.sprx`, `libSceAudioOut.sprx` (supplied separately),
-`libSceAudioSystem.sprx`, `orbis_audiod.elf`, `libSceAudio3d.sprx`, `libSceIpmi.sprx`,
-`libSceAvcap2.sprx`, `libSceAvcap2mvr.sprx`, `SceSysCore.elf`,
-`libSceVideoStreamingEngine{,_sys,AudioOnly}.sprx`, `libSceOpusCeltDec/Enc.sprx`,
-`libSceBluetoothHid.sprx`, `libSceHidControl.sprx`, `libSceUserService.sprx`,
-`Sce.Vsh.CloudClient.dll.sprx`, `Sce.Vsh.RemotePlay.dll.sprx`.
+```
+0x53a8a8  "main"                          0x53a8c8  "voice"
+0x53a8e8  "padspk"                         0x53a908  "haptic"
+          "InvalidSessionId"
+          "https://cc.prod.gaikai.com"     ".prod.gaikai.com"
+          "tak-d.TakionDaemon"             "/etc/gaikai-release"
+```
 
-**Nothing further is needed for Takion v15-20** (§9, item 2). The AV header sizes, the
-feature table and the curve list all came out of binaries already in hand; what remains
-there is code to write, not firmware to read.
+Four points fall out of that:
 
-### Tier 1 — closes the `output` / `flag` constants
+- The four lane names are a contiguous array, stride `0x20`, in the order
+  **main, voice, padspk, haptic**. That is a lane-*kind* enum (0..3), not the flat
+  channel id space of §1, and the host names padspk as a first-class kind rather than as
+  an afterthought hung off haptic.
+- The string layout is `{ chars[16] @ +0x00, size @ +0x10, capacity @ +0x18 }`, confirmed
+  against the destructor at `0x30150` (`cmp [rdi+0x18], 0x10` picks heap vs inline). Worth
+  recording because it is not libstdc++'s layout and offsets read wrong if assumed.
+- `cc.prod.gaikai.com` is the Gaikai cloud control plane, and the binary also carries
+  `Got sessionId from cloud: %s` and `Received config from cloud.` — so the *server*
+  half of a cloud session is in here, not only the remote play half.
+- `/etc/gaikai-release` is read at `0x1d8f10` as an ifstream, one `getline` into a member
+  at `+0xb98`. That file exists on a Gaikai datacenter unit and not on a retail console,
+  which is a plausible mechanism for exactly the split this whole document is about: one
+  binary, two modes, and the retail mode skipping work the cloud mode does.
 
-This is the one open item that is pure reverse engineering (§9, item 1). The read side is
-exhausted; these are the writer side.
+The padspk *reader* is present on both: `0x221b80` is a single audio thread function
+carrying a per-kind error string for each lane, and the padspk one
+(`"AvCap audioThread padspk last error: [ReadFrameResult:"`, referenced at `0x2232c1` and
+`0x223349`) sits beside the haptic one (`0x222671`, `0x2226f9`). A full scan for the
+consumer slots confirms the earlier finding rather than softening it:
 
-| Path | Why |
-| --- | --- |
-| `/system/common/lib/libSceMbus.sprx` | **The single highest-value file.** `orbis_audiod.elf` loads MBUS before anything else, and libSceAudioOut's `sceAudioOut2IpmiMbusSetPortConnections` / `sceAudioOut2IpmiMbusSetPortStatuses` are thin IPMI wrappers that hand port state straight to it. MBUS is where the `output` destination bits are assigned, not merely post-processed. |
-| `/system/common/lib/libSceAudioIn.sprx` | Mirror API over the same shm port object: `sceAudioInGetPortState` reads the same state words with a different legal port-type set. Diffing the two separates destination bits from device-state bits without guessing. |
-| `/system/common/lib/libScePad.sprx` | The missing half of "the console does not feed the channels": how an audio-out port of type 4 is bound to a *specific pad handle*. The channel `6+pad` to physical controller pairing is currently inference from the client side only. |
-| `/system/common/lib/libSceAjm.sprx` | AJM is the codec/job engine `orbis_audiod` loads alongside MBUS. Needed to see whether the console expects a type-4 port to carry PCM or an encoded payload — the console-side counterpart of the `isRawPcm = 0` finding in `declareChannel`. |
-| `/system/common/lib/libSceAjmi.sprx` | The instance/IPC half of the above; the port-to-job binding is likelier to live here than in libSceAjm proper. |
-| `/system/priv/lib/libSceAudiodecCpuOpus.sprx` | If the pad-speaker lane is Opus on the console too, this is the decoder the daemon reaches for, and its frame parameters pin the lane format from the host side rather than from the client's `declareChannel`. |
+```
++0x418 video    created at 0x21c6ad / 0x21c8ac
++0x420 main     created at 0x21ca5d
++0x428 haptic   created at 0x21cb78
++0x430 padspk   released at 0x21ad03/0x21ad15, read at 0x22288a — never written
+```
 
-### Tier 2 — why an allocated channel stays silent
+So the slot is declared, destructed and read, and nothing in this build constructs it.
+That is what "purposefully left unsoldered" looks like in a binary, and it is why the
+cloud-mode branch is the thing to chase.
 
-| Path | Why |
-| --- | --- |
-| `/system/common/lib/libSceRemoteplay.sprx` | The game-facing remote play library — the API a *title* uses to learn it is being streamed. If a title has to opt a pad-speaker port into the stream, the opt-in is declared here, and that would be the actual reason the host-side consumer at `+0x430` is never created. |
-| `/system_ex/app/NPXS40087/eboot.bin` | The PS Plus cloud-streaming app host. Its `libScePSNowGkp.sprx` is in hand but the eboot that drives it is not, and the cloud client's own audio wiring — including whether it ever asks for padspk — lives in the eboot. |
-| `/system_ex/app/NPXS40087/psm/Application/app.exe.sprx` | The same app's managed front end. Managed binaries keep readable enum and field names where the native side has only numeric ids, so this is the cheap way to name what §4 currently describes by offset. |
-| `/system_ex/app/NPXS40087/psm/Application/resource/Sce.Vsh.ShellUI.Settings.Peripherals.AudioDeviceSettings.rco` | The settings UI that lists audio output destinations to the user. Its resource table is the cheapest plausible source of human-readable names for the very `output` values Tier 1 is chasing. |
-
-### Tier 3 — cross-checks, worth taking if the pull is cheap
-
-| Path | Why |
-| --- | --- |
-| `/system/common/lib/libSceCustomMusicAudioOut.sprx` | A second, independent caller of `sceAudioOutOpen` using unusual port types — an outside check on the `0x441f` port-type mask in §6. |
-| `/system/common/lib/libScePadTracker.sprx` | Pad enumeration order. Confirms the pad index behind channel `6+pad` is the same index libScePad reports, rather than a separate audio-side numbering. |
-| `/system/common/lib/libSceAudioPropagation.sprx` | 3D audio placement. Only needed to confirm padspk is excluded from the 3D mix, which bears on the `mixToMain` gate in §7. |
-| `/system/common/lib/libSceAudiodec.sprx` and `/system/common/lib/libSceAudiodecCpu.sprx` | Generic decoder dispatch; relevant only if AJM turns out to route padspk through the generic path instead of the Opus one. |
-
-### Not obtainable this way
-
-`/dev/mbus` and `/dev/mbus_av` appear in the listing but are device nodes, not files --
-they carry no content to dump. The daemon's view of the port table is reachable only
-through `libSceMbus.sprx` and `libSceAudioSystem.sprx`, which is why Tier 1 leads with
-the former.
+One more small confirmation of the premise: `gaikai-player.sprx` is byte-identical
+(md5 `92f5af67…`) under NPXS40074 and NPXS40099. Cloud and remote play are not merely the
+same protocol — on the client they are the same file.
 
 ---
 
-## 11. Reproducing the analysis
+## 11. Firmware files still needed
+
+Checked against the FTP listing of a live console (`ps5_filelist.txt`, 11 499 paths).
+Every path below was verified to exist in that listing, so each is pullable as written.
+
+**Already in hand**, so nothing gets re-pulled: `gaikai-player.sprx`,
+`/system/vsh/app/NPXS40102/eboot.bin`, `libScePSNowGkp.sprx`,
+`Sce.Vsh.CloudClient.dll.sprx`, both `ReactNative.*.Vsh.PSNowPlayer.dll.sprx`,
+`psnow-config.env`, `psnow-subsids.env`, NPXS40074's `app.exe.sprx`, `rp.json` and
+`Sce.Vsh.RemotePlay.dll.sprx`, `libSceAudioOut.sprx` (supplied separately),
+`libSceAudioSystem.sprx`, `orbis_audiod.elf`, `libSceAudio3d.sprx`, `libSceIpmi.sprx`,
+`libSceAvcap2.sprx`, `libSceAvcap2mvr.sprx`, `SceSysCore.elf`,
+`libSceVideoStreamingEngine{,_sys,AudioOnly}.sprx`, `libSceOpusCeltDec/Enc.sprx`,
+`libSceBluetoothHid.sprx`, `libSceHidControl.sprx`, `libSceUserService.sprx`.
+
+**Takion v15-20 needs no further firmware** (§9, item 2). Header sizes, the feature table
+and the curve list all came out of binaries already in hand; that part is code to write.
+
+### Top 10
+
+1. `/system/common/lib/libSceMbus.sprx`
+   The single highest-value file. `orbis_audiod.elf` loads MBUS before anything else, and
+   libSceAudioOut's `sceAudioOut2IpmiMbusSetPortConnections` / `SetPortStatuses` are thin
+   IPMI wrappers straight into it. MBUS is the *writer* of the port-state words; every
+   binary read so far has been a reader. This is what closes the `output` / `flag`
+   constants of §9.
+
+2. `/system_ex/app/NPXS40099/eboot.bin`
+   The cloud player's own app process — the thing that loads `gaikai-player.sprx` and
+   builds the audio settings the host reads. The player library is in hand; the process
+   that configures it is not.
+
+3. `/system_ex/app/NPXS40074/eboot.bin`
+   The remote play app process. Same lineage, and since the player library is byte
+   identical between the two apps, diffing these two eboots isolates whatever is
+   cloud-only in the client's session setup.
+
+4. `/system/common/lib/libScePad.sprx`
+   The local half of "channel `6+pad` belongs to controller N": how an audio-out port of
+   type 4 is bound to a specific pad handle. Currently inferred from the client only.
+
+5. `/system/common/lib/libSceAudioIn.sprx`
+   A mirror reader over the same shared-memory port object with a different legal
+   port-type set. Diffing it against libSceAudioOut separates destination bits from
+   device-state bits without guessing.
+
+6. `/system_ex/app/NPXS40087/psm/Application/resource/Sce.Vsh.ShellUI.Settings.Peripherals.AudioDeviceSettings.rco`
+   The settings UI that lists audio output destinations to the user. Its resource table is
+   the cheapest plausible source of human-readable names for the very `output` values
+   item 1 is chasing.
+
+7. `/system/common/lib/libSceRemoteplay.sprx`
+   The game-facing streaming API — what a *title* uses to learn it is being streamed. If a
+   title has to opt a pad-speaker port into the stream, that opt-in is declared here, and
+   it would explain the never-constructed consumer at `+0x430`.
+
+8. `/system_ex/app/NPXS40087/eboot.bin`
+   The ShellUI system process. It is not itself the cloud app, but it is the process that
+   hosts `libScePSNowGkp.sprx` and owns the audio device settings, so it sits on both
+   sides of this problem.
+
+9. `/system/common/lib/libSceAjm.sprx`
+   AJM is the codec/job engine `orbis_audiod` loads alongside MBUS. Settles whether the
+   console expects a type-4 port to carry PCM or an encoded payload — the console-side
+   counterpart of the `isRawPcm = 0` finding in `declareChannel`.
+
+10. `/system/common/lib/libSceCloudMessaging.sprx`
+    Nothing in hand references `/dev/cloudsd` or `/dev/cloudsd2`, both of which are in the
+    listing. This is the only plausible owner of those nodes, and therefore the only
+    candidate for a console-side cloud control channel.
+
+### The rest
+
+- `/system/common/lib/libSceAjmi.sprx`
+  The instance/IPC half of AJM; the port-to-job binding is likelier here than in libSceAjm.
+
+- `/system/priv/lib/libSceAudiodecCpuOpus.sprx`
+  If padspk is Opus console-side too, this is the decoder the daemon reaches for, and its
+  frame parameters pin the lane format from the host rather than from `declareChannel`.
+
+- `/system_ex/app/NPXS40099/psm/Application/app.exe.sprx`
+  The cloud app's managed front end. NPXS40074's equivalent is in hand; this one is not,
+  and managed binaries keep readable enum and field names where the native side has ids.
+
+- `/system_ex/app/NPXS40087/psm/Application/app.exe.sprx`
+  ShellUI's managed front end, same reasoning, for the audio-device side.
+
+- `/system_ex/app/NPXS40099/json-configs/rp.json`
+  NPXS40074's copy is in hand and is a *client* profile (`"clientName":"PCClient"`,
+  `"audioChannels":"2.1"`). If NPXS40099's differs, the delta is the cloud profile.
+
+- `/system_ex/app/NPXS40074/sce_sys/param.json` and
+  `/system_ex/app/NPXS40099/sce_sys/param.json`
+  Tiny. They name the two apps outright, which removes the last guesswork about which
+  title id is cloud and which is remote play.
+
+- `/system_ex/app/NPXS40087/gls/gls_config.json` and
+  `/system_ex/app/NPXS40087/gls/gls_provider_profile.json`
+  Game live streaming profiles. A third streaming audio path, useful only as a contrast
+  case for how lanes are declared.
+
+- `/system_ex/app/NPXS40099/psm/Application/Sce.Vsh.RemotePlay.dll.sprx`
+  Probably identical to NPXS40074's, which is in hand. Worth a hash comparison only.
+
+- `/system/common/lib/libSceCustomMusicAudioOut.sprx`
+  A second, independent caller of `sceAudioOutOpen` using unusual port types — an outside
+  check on the `0x441f` port-type mask in §6.
+
+- `/system/common/lib/libScePadTracker.sprx`
+  Pad enumeration order. Confirms the index behind channel `6+pad` is the same index
+  libScePad reports rather than a separate audio-side numbering.
+
+- `/system/common/lib/libSceAudioPropagation.sprx`
+  3D audio placement. Only needed to confirm padspk is excluded from the 3D mix, which
+  bears on the `mixToMain` gate in §7.
+
+- `/system/common/lib/libSceAudiodec.sprx` and `/system/common/lib/libSceAudiodecCpu.sprx`
+  Generic decoder dispatch; relevant only if AJM turns out to route padspk through the
+  generic path instead of the Opus one.
+
+- `/system/vsh/app/NPXS40102/eboot.bin`
+  Already in hand, but from a different archive than this listing. A re-pull matched to
+  the listing's firmware would confirm every address in this document against one known version.
+
+### Not obtainable this way
+
+`/dev/mbus`, `/dev/mbus_av`, `/dev/cloudsd` and `/dev/cloudsd2` appear in the listing but
+are device nodes — there is no content to dump. They are reachable only through the
+modules that open them, which is why `libSceMbus.sprx` and `libSceCloudMessaging.sprx`
+lead the two halves of the list above.
+
+---
+
+## 12. Reproducing the analysis
 
 Tooling used was a small Python harness over `capstone`, with segment maps taken from each
 binary's program headers (`readelf -l`), since neither binary has section headers.
@@ -706,4 +835,8 @@ client  0x84ec0   channel-id allocator          0x2511f0  feature predicate
 host    0x169910  feature predicate             0x21d5a0  declareChannel
         0x21b720  AvCap init                    0x221b80  audio thread (main/haptic/padspk)
         0x28ec8a  audioSettings JSON parser     0x21ac40  consumer destructor
+        0x1e0910  cloud constants init          0x1d8f10  /etc/gaikai-release read
+        0x30150   Gaikai string destructor      0x53a8a8  lane-name array (0x20 stride)
+        0x21c6ad/0x21c8ac  video consumer       0x21ca5d  main consumer
+        0x21cb78  haptic consumer               (no site) padspk consumer
 ```

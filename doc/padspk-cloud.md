@@ -621,19 +621,79 @@ calls `0x2239c0`, and `0x2239c0` rejects exactly the lanes those sites feed, bec
 `submitFrame` use the same map; and `[node+0x28]` is the map's value slot, null-checked at
 `0x223a71` before the `+0x38` test.
 
-Two readings survive, and they are not equally cheap to test:
+Two readings survived static analysis of that function alone: that `0x2239c0` is a
+secondary tap the per-controller lanes skip, or that `+0x38` means something narrower than
+assumed. Following a haptic frame from `readFrame` outward — next — rules out both of the
+obvious answers and leaves a third.
 
-1. `0x2239c0` is a secondary tap — a local mixdown, recorder or metrics path that main and
-   voice take and the per-controller lanes deliberately skip — and haptic leaves the host
-   by a route this function does not show. The haptic block calls nothing else with the
-   frame except the consumer's `readFrame` at `0x2222cc`, so that route would have to be
-   outside `0x221b80` entirely.
-2. `+0x38` means something narrower than "this channel is live", and the name is wrong.
+### Following a haptic frame
 
-What decides it is haptics, not padspk: haptics demonstrably reaches a remote play client
-today, so following a real haptic frame from `readFrame` to the wire says which of the two
-holds. That is a better next step than more static reading, and it needs a host, not
-another binary.
+The haptic block in the audio thread, in full:
+
+```
+0x2222aa  rdi = this->+0x428                  ; the haptic AvCap consumer
+0x2222b4  if null -> error path
+0x2222cc  call [consumer_vtable + 0x20]       ; readFrame(&info@-0x198, 1, &err@-0x19c)
+          r14 = frame buffer
+0x222359  require info == 2 and err >= 0
+0x222379  r15 = byte length
+0x222393  r15 >>= 2                           ; /4 -> sample count (2ch x 16bit)
+0x222397  call 0x43eb30                       ; timestamp
+          descriptor @ -0x50 = { ts, sampleCount, tag = 4, flag = 0 }
+0x2223b2  call 0x22fd80                       ; (A)
+0x2223b7  r13d = 0
+  loop    id = 0x1e69d0("haptic", r13d)       ; 2..5
+0x22251e  call 0x2239c0                       ; (B)
+```
+
+Nothing else in the block touches the frame. So the frame leaves by (A), by (B), or
+inside `readFrame` itself. All three are now checked.
+
+**(A) is telemetry, and it is inert.** `0x22fd80` is a method on the class whose
+constructor at `0x22f8b0` names itself `StreamCollectorSender`, and it is a type-filtered
+queue push:
+
+```
+0x22fda0  require this->+0x138 & 1            ; enabled
+0x22fdb2  tag = desc->+0x0c
+0x22fdb6  require tag != 0
+0x22fdbf  linear search tag in [this->+0x120, this->+0x128)
+0x22fdee  not found -> return, frame dropped
+```
+
+The accepted-type list is hardcoded in the constructor and never appended to:
+
+```
+0x22fa8d  mov edi, 8          ; operator new(8) -- exactly four uint16_t
+0x22faa7  movabs rdx, 0x8000700060005
+0x22fabf  mov [rax], rdx      ; the list is { 5, 6, 7, 8 }
+```
+
+The audio thread pushes tag `4` (haptic, `0x22238d`) and tag `2` (`0x22358c`). Neither is
+in `{5, 6, 7, 8}`, so both are dropped at `0x22fde0`. When the queue *is* full it reports
+`currentSize` / `maxSize` as JSON — a metrics sink, not a transport. (A) carries nothing.
+
+**(B) rejects haptic**, as established above: `+0x38` is false for haptic and padspk, and
+`0x2239c0` returns at `0x223a97` without doing anything.
+
+**So the frame leaves inside `readFrame`.** That is the only route left, and it fits
+everything else. `[consumer_vtable + 0x20]` is a virtual call on an object whose class is
+not in this binary (§ "Is there a voice consumer to repurpose?"), and the audio thread's
+job is then to *pump* the consumer rather than to carry its output: read a frame, timestamp
+it, offer it to a telemetry sink that ignores it, offer it to a submit path that ignores
+it, repeat. The transport lives on the far side of that vtable, in the module that supplies
+the factory.
+
+Stated as confidence rather than fact: this is the reading the evidence supports, and it
+is not proven, because the consumer's class cannot be read from any file in hand. What
+would prove it is `libSceRemoteplay.sprx` or whatever else implements the factory — the
+same file already at the top of the wanted list for a different reason.
+
+If it holds, it sharpens the conclusion rather than changing it. padspk is missing exactly
+one thing, and it is the thing that *is* the wire: the consumer at `+0x430`. Everything
+this document has traced downstream of it — the channel objects, the ids, the JSON, the
+two gates — is present and correct, and none of it can matter while the object that would
+produce and forward frames is never constructed.
 
 ### Is there a voice consumer to repurpose?
 
@@ -1094,4 +1154,6 @@ host    0x169910  feature predicate             0x21d5a0  declareChannel
         0x1e69d0  host channel-id allocator     0x21c420  writes channel +0x38
         0x2239c0  submitFrame (gated on +0x38)  0x228210  map<id, channel*> helper
         0x2258a0  setAvCapFactory (injected)    this+0x17e8  channel map
+        0x22f8b0  StreamCollectorSender ctor    0x22fd80  its type-filtered push
+        0x22faa7  accepted types {5,6,7,8}      0x2222cc  haptic readFrame (vtable+0x20)
 ```

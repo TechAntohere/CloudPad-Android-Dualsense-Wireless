@@ -553,6 +553,76 @@ pad lane being folded into main. So `mixToMain = true` is not merely "prefer the
 mix" — it makes the host reject the separate lane at `0x21bf17` *and* mix the audio into
 main instead, which is why both the user-facing behaviour and the gate agree.
 
+### The host's own channel-id allocator
+
+`0x1e69d0(name, padIndex)` is the host's equivalent of the client's `0x84ec0`, and it
+settles the channel model from the other side:
+
+```
+name == "main"   -> 0
+name == "voice"  -> 1
+name == "haptic" -> padIndex + 2
+name == "padspk" -> padIndex + 6
+otherwise        -> 10            ; the invalid/count sentinel
+```
+
+Read straight out of `0x1e6a77`-`0x1e6af8` (`add ebx, 2` for haptic, `add ebx, 6` for
+padspk, `mov eax, 0xa` as the fallthrough). This is §1's flat id space confirmed on the
+host, derived independently of the client, including that 10 is the sentinel — the same
+10 the acceptance path rejects at `0x21bf0a`.
+
+### The `+0x38` flag
+
+The per-channel object built at `0x21c34e` is `0x40` bytes and carries, at `+0x38`, the
+byte set at `0x21c420` from `[rbp-0x121]`, which is written exactly once, at `0x21c276`,
+as `!(haptic || padspk)`. Nothing else writes it. So `+0x38` is true for main, voice and
+video, and false for the two per-controller lanes.
+
+It is read in exactly one place. `0x2239c0` — call it `submitFrame(this, buf, len, ?, ?,
+channelId)` — locks the mutex at `this+0x17f8`, looks up `channelId` in the channel map at
+`this+0x17e8` (via the same `std::map` helper `0x228210`, node key `+0x20`, value `+0x28`),
+and then:
+
+```
+0x223a8f  mov rax, [rax + 0x28]        ; the channel object
+0x223a93  cmp byte [rax + 0x38], 1
+0x223a97  jne 0x223a41                 ; unlock and return, doing nothing
+```
+
+So `submitFrame` is a hard no-op for any haptic or padspk channel. Seven call sites reach
+it, all inside the audio thread `0x221b80`: two pass literal ids (`0` at `0x22353d`, `1`
+at `0x223567`) and four pass `0x1e69d0(name, padIndex)` — that is, ids that can be
+`2..5` or `6..9`.
+
+**What this does not yet establish.** The obvious reading — that the host computes
+per-controller frames and then drops them at `0x223a93` — requires knowing which lane each
+of those four sites belongs to, and code layout cannot answer it here. The compiler has
+interleaved basic blocks across lanes: the block at `0x2234f0`, which sits *after* the
+padspk error string at `0x223349`, tests `mixToMain` and branches back to `0x221ea6` in
+the main section, then submits to ids 0 and 1. Proximity to a lane's error string proves
+nothing about section membership in this function. Pinning the four callers needs the
+name string each one passes to `0x1e69d0` traced back to its source, which is the next
+step on this thread.
+
+### Is there a voice consumer to repurpose?
+
+Worth asking, because padspk is voice field for field (§7). The answer at this layer is
+no, and the reason is informative.
+
+The AvCap factory pointer at `this+0x17c0` is touched seven times in the whole image and
+the vtable is used at exactly four slots: `+0x10` video, `+0x18` main audio, `+0x20`
+haptic, `+0x28` release. There is no voice creator to borrow — voice on the host is a
+capture path, not a playback consumer, so nothing at this layer can be aliased onto
+padspk. And the ids differ anyway: `0x1e69d0` makes voice a single global channel (1)
+while padspk is per-pad (6+n), so they cannot simply share.
+
+The factory's concrete class is not in this binary: no RTTI names survive, no relocation
+points a vtable slot at the setter `0x2258a0`, and its only reference is a jump thunk at
+`0x219c50` with no in-image caller. It is injected from outside. Grepping every module in
+hand — `libSceAvcap2.sprx`, `libSceAvcap2mvr.sprx` (both thin IPC stubs) and
+`SceSysCore.elf` — finds no `padspk` string at all, so the module that implements the
+factory, and would carry a fifth creator slot if one exists, is one we do not have.
+
 ### The `audioSettings` schema
 
 The parser at `0x28e0xx`-`0x28f1xx` gives the exact shape the host accepts. `settings` is
@@ -990,4 +1060,7 @@ host    0x169910  feature predicate             0x21d5a0  declareChannel
         0x21bf17  mixToMain gate                0x21c260  per-controller channel loop
         0x28eca9  "mixToMain" key               0x28ee0d  "audioChannels" key
         0x222a1f  mono-into-main mixer          0x53b2a8  host lane-name table
+        0x1e69d0  host channel-id allocator     0x21c420  writes channel +0x38
+        0x2239c0  submitFrame (gated on +0x38)  0x228210  map<id, channel*> helper
+        0x2258a0  setAvCapFactory (injected)    this+0x17e8  channel map
 ```

@@ -691,7 +691,7 @@ Every path below was verified to exist in that listing, so each is pullable as w
 **Takion v15-20 needs no further firmware** (§9, item 2). Header sizes, the feature table
 and the curve list all came out of binaries already in hand; that part is code to write.
 
-### Top 10
+### Top 20
 
 1. `/system/common/lib/libSceMbus.sprx`
    The single highest-value file. `orbis_audiod.elf` loads MBUS before anything else, and
@@ -744,30 +744,44 @@ and the curve list all came out of binaries already in hand; that part is code t
     listing. This is the only plausible owner of those nodes, and therefore the only
     candidate for a console-side cloud control channel.
 
+11. `/system/common/lib/libSceAjmi.sprx`
+    The instance/IPC half of AJM; the port-to-job binding is likelier here than in
+    libSceAjm proper.
+
+12. `/system/priv/lib/libSceAudiodecCpuOpus.sprx`
+    If padspk is Opus console-side too, this is the decoder the daemon reaches for, and
+    its frame parameters pin the lane format from the host rather than from
+    `declareChannel`.
+
+13. `/system_ex/app/NPXS40099/psm/Application/app.exe.sprx`
+    The cloud app's managed front end. NPXS40074's equivalent is in hand; this one is not,
+    and managed binaries keep readable enum and field names where the native side has ids.
+
+14. `/system_ex/app/NPXS40099/json-configs/rp.json`
+    NPXS40074's copy is in hand and is a *client* profile (`"clientName":"PCClient"`,
+    `"audioChannels":"2.1"`). If NPXS40099's differs, the delta is the cloud profile.
+
+15. `/system_ex/app/NPXS40074/sce_sys/param.json`
+16. `/system_ex/app/NPXS40099/sce_sys/param.json`
+    Tiny. They name the two apps outright, which removes the last guesswork about which
+    title id is cloud and which is remote play.
+
+17. `/system_ex/app/NPXS40087/psm/Application/app.exe.sprx`
+    ShellUI's managed front end, same reasoning as 13, for the audio-device side.
+
+18. `/system/common/lib/libSceCustomMusicAudioOut.sprx`
+    A second, independent caller of `sceAudioOutOpen` using unusual port types — an
+    outside check on the `0x441f` port-type mask in §6.
+
+19. `/system/common/lib/libScePadTracker.sprx`
+    Pad enumeration order. Confirms the index behind channel `6+pad` is the same index
+    libScePad reports rather than a separate audio-side numbering.
+
+20. `/system/common/lib/libSceAudiodec.sprx`
+    Generic decoder dispatch; relevant if AJM turns out to route padspk through the
+    generic path instead of the Opus one.
+
 ### The rest
-
-- `/system/common/lib/libSceAjmi.sprx`
-  The instance/IPC half of AJM; the port-to-job binding is likelier here than in libSceAjm.
-
-- `/system/priv/lib/libSceAudiodecCpuOpus.sprx`
-  If padspk is Opus console-side too, this is the decoder the daemon reaches for, and its
-  frame parameters pin the lane format from the host rather than from `declareChannel`.
-
-- `/system_ex/app/NPXS40099/psm/Application/app.exe.sprx`
-  The cloud app's managed front end. NPXS40074's equivalent is in hand; this one is not,
-  and managed binaries keep readable enum and field names where the native side has ids.
-
-- `/system_ex/app/NPXS40087/psm/Application/app.exe.sprx`
-  ShellUI's managed front end, same reasoning, for the audio-device side.
-
-- `/system_ex/app/NPXS40099/json-configs/rp.json`
-  NPXS40074's copy is in hand and is a *client* profile (`"clientName":"PCClient"`,
-  `"audioChannels":"2.1"`). If NPXS40099's differs, the delta is the cloud profile.
-
-- `/system_ex/app/NPXS40074/sce_sys/param.json` and
-  `/system_ex/app/NPXS40099/sce_sys/param.json`
-  Tiny. They name the two apps outright, which removes the last guesswork about which
-  title id is cloud and which is remote play.
 
 - `/system_ex/app/NPXS40087/gls/gls_config.json` and
   `/system_ex/app/NPXS40087/gls/gls_provider_profile.json`
@@ -777,25 +791,44 @@ and the curve list all came out of binaries already in hand; that part is code t
 - `/system_ex/app/NPXS40099/psm/Application/Sce.Vsh.RemotePlay.dll.sprx`
   Probably identical to NPXS40074's, which is in hand. Worth a hash comparison only.
 
-- `/system/common/lib/libSceCustomMusicAudioOut.sprx`
-  A second, independent caller of `sceAudioOutOpen` using unusual port types — an outside
-  check on the `0x441f` port-type mask in §6.
-
-- `/system/common/lib/libScePadTracker.sprx`
-  Pad enumeration order. Confirms the index behind channel `6+pad` is the same index
-  libScePad reports rather than a separate audio-side numbering.
+- `/system/common/lib/libSceAudiodecCpu.sprx`
+  The CPU half of the generic decoder dispatch, only if 20 turns out to matter.
 
 - `/system/common/lib/libSceAudioPropagation.sprx`
   3D audio placement. Only needed to confirm padspk is excluded from the 3D mix, which
   bears on the `mixToMain` gate in §7.
 
-- `/system/common/lib/libSceAudiodec.sprx` and `/system/common/lib/libSceAudiodecCpu.sprx`
-  Generic decoder dispatch; relevant only if AJM turns out to route padspk through the
-  generic path instead of the Opus one.
-
 - `/system/vsh/app/NPXS40102/eboot.bin`
   Already in hand, but from a different archive than this listing. A re-pull matched to
-  the listing's firmware would confirm every address in this document against one known version.
+  the listing's firmware would confirm every address in this document against one known
+  version.
+
+### Copy-paste list
+
+All 20 verified present in `ps5_filelist.txt` and absent from what is already extracted.
+
+```
+/system/common/lib/libSceMbus.sprx
+/system_ex/app/NPXS40099/eboot.bin
+/system_ex/app/NPXS40074/eboot.bin
+/system/common/lib/libScePad.sprx
+/system/common/lib/libSceAudioIn.sprx
+/system_ex/app/NPXS40087/psm/Application/resource/Sce.Vsh.ShellUI.Settings.Peripherals.AudioDeviceSettings.rco
+/system/common/lib/libSceRemoteplay.sprx
+/system_ex/app/NPXS40087/eboot.bin
+/system/common/lib/libSceAjm.sprx
+/system/common/lib/libSceCloudMessaging.sprx
+/system/common/lib/libSceAjmi.sprx
+/system/priv/lib/libSceAudiodecCpuOpus.sprx
+/system_ex/app/NPXS40099/psm/Application/app.exe.sprx
+/system_ex/app/NPXS40099/json-configs/rp.json
+/system_ex/app/NPXS40074/sce_sys/param.json
+/system_ex/app/NPXS40099/sce_sys/param.json
+/system_ex/app/NPXS40087/psm/Application/app.exe.sprx
+/system/common/lib/libSceCustomMusicAudioOut.sprx
+/system/common/lib/libScePadTracker.sprx
+/system/common/lib/libSceAudiodec.sprx
+```
 
 ### Not obtainable this way
 

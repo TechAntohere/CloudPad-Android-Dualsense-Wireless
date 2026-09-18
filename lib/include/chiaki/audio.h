@@ -118,6 +118,26 @@ static inline uint8_t chiaki_audio_channel_padspk(uint8_t controller_index)
 #define CHIAKI_AUDIO_OUT_PORT_TYPE_VOICE  2
 #define CHIAKI_AUDIO_OUT_PORT_TYPE_PADSPK 4
 
+/**
+ * Port types sceAudioOutOpen accepts, as the bitmask it validates against: types
+ * 0, 1, 2, 3, 4, 10 and 14. So the pad speaker type is a first-class one, not a
+ * value smuggled through a general path.
+ */
+#define CHIAKI_AUDIO_OUT_PORT_TYPE_VALID_MASK 0x441f
+
+static inline bool chiaki_audio_out_port_type_valid(unsigned type)
+{
+	return type < 16 && ((CHIAKI_AUDIO_OUT_PORT_TYPE_VALID_MASK >> type) & 1);
+}
+
+/**
+ * Value sceAudioOutGetPortState reports for the volume of a port that is not a pad
+ * speaker. Only a type-4 port carries a real volume there -- every other type reads
+ * back saturated -- so in a PORTSTATES group, a pad speaker port is the one whose
+ * volume is not this.
+ */
+#define CHIAKI_AUDIO_OUT_VOLUME_NOT_REPORTED 0xffff
+
 static inline uint8_t chiaki_audio_channel_out_port_type(uint8_t channel)
 {
 	if(channel == CHIAKI_AUDIO_CHANNEL_VOICE)
@@ -220,11 +240,19 @@ static inline size_t chiaki_audio_header_frame_buf_size(ChiakiAudioHeader *audio
  * is a field-major transpose of those across a group's four ports, so this struct is
  * also the wire layout.
  *
- * The call is confirmed, not guessed: its NID, GrQ9s4IrNaQ, resolves to
- * sceAudioOutGetPortState in a libSceAudioOut symbol table. That agrees with where the
- * import sits (library libSceAudioOut, beside sceAudioOutOpen, rather than
- * libSceAudioOut2), and the three offsets read plus the 32-byte stack slot the caller
- * gives it match SceAudioOutPortState exactly.
+ * Confirmed against libSceAudioOut itself. Its NID, GrQ9s4IrNaQ, resolves to
+ * sceAudioOutGetPortState, and the implementation fills exactly this struct. What it
+ * does, beyond copying the daemon's values through:
+ *
+ *  - volume is forced to CHIAKI_AUDIO_OUT_VOLUME_NOT_REPORTED for every port type
+ *    except 4, the pad speaker, which is the only type whose real volume is reported.
+ *  - output has bit 1 set whenever bit 0 is set.
+ *  - for a voice port (type 2) with bit 2 set, output's low three bits become 3.
+ *  - flag is a dword from the daemon, zero when its capability check fails, widened
+ *    into the struct's 64-bit field.
+ *
+ * The values behind output and flag originate in the audio daemon over IPC, so the
+ * module gives their rules but not their constant names.
  */
 typedef struct chiaki_audio_state_port_t
 {

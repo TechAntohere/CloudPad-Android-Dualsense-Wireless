@@ -363,6 +363,56 @@ PS5-only.
 Note the teardown idiom this confirms: `sceAudioOutOutput(handle, NULL)` to drain, then
 `sceAudioOutClose(handle)`.
 
+### Inside libSceAudioOut
+
+The module itself was later obtained, so the following is read off the implementation
+rather than inferred.
+
+**Legal port types.** `sceAudioOutOpen` validates the type against the bitmask
+`0x441f`, i.e. types **0, 1, 2, 3, 4, 10, 14** (plus `0x7d` and `0x7f` as special
+cases). Type 4, the pad speaker, is a first-class type, not a value smuggled through a
+general path.
+
+**`sceAudioOutGetPortState` (`0x2460`)** validates `(handle & 0x7f000000) == 0x20000000`
+with a port index of `handle & 0xffff` below `0x21` (33 ports), then fetches the state
+over IPC from the audio daemon and post-processes it:
+
+```c
+state->output  = daemon.word0;
+state->channel = daemon.byte2;
+if (capability_ok()) {
+    if (state->output & 1)                     // bit 0 implies bit 1
+        state->output |= 2;
+    if (port->type == 2 /* VOICE */ && (state->output & 4))
+        state->output = (state->output & ~7) | 3;
+}
+state->rerouteCounter = daemon.word6;
+state->flag = capability_ok() ? daemon.dword8 : 0;
+
+state->volume = 0xffff;                        // <-- note
+if (port->type == 4 /* PADSPK */)
+    state->volume = daemon.word4;
+```
+
+Two things matter here.
+
+**Volume identifies a pad speaker port.** Every port type reads back `0xffff` for volume
+*except* type 4, which is the only one whose real volume is reported. So within a
+PORTSTATES group, the pad speaker port is the one whose volume is not `0xffff`. Recorded
+as `CHIAKI_AUDIO_OUT_VOLUME_NOT_REPORTED`.
+
+`sceAudioOutSetVolume` shows the same asymmetry from the other side: for a type-4 port it
+converts the integer to float, scales and clamps it, and sends it to the daemon as its
+own parameter (id `0xa`); every other type goes down a different path.
+
+**`output` bit rules**, though not the constant names: bit 1 is set whenever bit 0 is,
+and a voice port with bit 2 set has its low three bits forced to 3. The values
+themselves originate in the audio daemon over IPC, so the module gives the rules but not
+the enum.
+
+Port table internals, if needed again: base `0x6cf98`, stride `0x1040`, port type at
+`+0x1020`, refcount at `+0x102c`, a disable bit at `+0x103a & 0x40`.
+
 ---
 
 ## 7. Retail remote play cannot do this
@@ -463,16 +513,19 @@ presumably what marks it as pad-speaker bound.
 
 Two ways to close it:
 
-- **`libSceAudioOut.sprx`, the binary** (`/system/common/lib/libSceAudioOut.sprx`) — not
-  in the firmware dump this was read from, confirmed three ways: absent from all seven
-  archive listings, absent from `libSceAudioSystem`'s parsed 323-symbol export table, and
-  a sweep of every ELF in the dump finds the symbol as an undefined import in 11 modules
-  and defined in none. With the real module the constants can be read off the
-  implementation directly.
+The module has since been read (see "Inside libSceAudioOut" above), which settled part of
+this and bounded the rest:
 
-  A **genstub `.c` is not enough** for this step. Those carry NID -> name mappings only —
-  no `#define`, no `enum`, no `struct` — which is what confirmed the function name above
-  but says nothing about the values. Only the module binary, or an SDK header, has those.
+- **Settled:** the legal port types, and that `volume` reads `0xffff` for every port type
+  except the pad speaker — which is itself a usable signal.
+- **Still open:** the `output` and `flag` constant values. These do not live in
+  libSceAudioOut at all; it receives them from the audio daemon over IPC and only
+  post-processes them. What the module does give is their *rules* (bit 0 implies bit 1;
+  voice plus bit 2 forces the low three bits to 3).
+
+So the remaining sources for the constants are an SDK header, or `orbis_audiod` /
+`libSceAudioSystem` on the daemon side of that IPC. A genstub `.c` is no use here: those
+carry NID -> name mappings only, no `#define`, `enum` or `struct`.
 - **Brute-force.** `output` is 16 bits with few meaningful values, `volume` is obvious,
   `flag`'s low half is likely small. The host gives a clean per-attempt yes/no, and no
   capture decryption is needed. Practical now that the search space is three named fields

@@ -472,7 +472,7 @@ factory pointer (`this->+0x17c0`) is touched **exactly seven times in the whole 
 | `0x21c67c` | create video -> vtable `+0x10` -> slot `+0x418` |
 | `0x21c9f5` | create main audio -> `+0x18` -> slot `+0x420` |
 | `0x21cb5f` | create haptics -> `+0x20` -> slot `+0x428` |
-| `0x21ac43`, `0x21ac67`, `0x21ac96` | three releases -> `+0x28` |
+| `0x21ac43`, `0x21ac67`, `0x21ac96` | three destroys -> `+0x28` (see the factory-interface subsection below) |
 
 Three creates. **Slot `+0x430` — the one the host's own padspk capture section reads at
 `0x22288a` — has no creator anywhere.** Everything else for the lane is present: format
@@ -798,6 +798,124 @@ Worth being plain about what this block does and does not do. It gets the channe
 **allocated** — the host accepts the declaration and builds four per-controller objects
 (§7). It does not get them **fed**; that is the missing AvCap consumer, and no value in
 this JSON reaches it.
+
+---
+
+### The launchspec normalizer overwrites `audioSettings` (local host)
+
+Important correction to the section above, and it explains why hand-written `audioSettings`
+gets ignored on a local Remote Play host. `0x205040` is a **normalizer, not a parser**:
+
+```
+0x20505c  get   src."audioChannels"
+0x20507f  get   dst."audioSettings"
+0x20509b  "audioSettings" -> 0x1783e0      ; REMOVE the member
+0x2050a7  new object
+0x2050b0  re-add "audioSettings"
+0x2050c7  re-add "audioChannels"
+0x2050e0  source it from "audioChannelSettings"
+0x20512e  first entry "main"
+```
+
+So whatever `audioSettings` the launchspec carries is **discarded and rebuilt** from
+`audioChannelSettings`. On a local host the block in the previous subsection is therefore
+the shape the downstream parser accepts, not a thing a client can supply and have survive.
+The grant has to come from the launchspec the allocator seals, which on cloud is the
+allocator's to write and not the client's.
+
+(Independently found and confirmed here against `0x1783e0`, which is the JSON remove-member
+helper.)
+
+### The full grant chain
+
+```
+launchspec audioSettings.audioChannels[].name
+  -> channel-name list at session+0x1D8        (std::list, sentinel-based)
+  -> 0x21BC50   iterates it; empty list -> 0x21C625
+  -> 0x1E69D0   (name, pad_index) -> lane type
+  -> 0x21D5A0   per-channel default builder (sole caller: 0x21BC50)
+  -> capability(10, version)
+  -> STREAMINFO
+```
+
+`0x1E69D0` was decoded twice, independently, from opposite directions, with identical
+results: `main` 0, `voice` 1, `haptic` 2+index, `padspk` 6+index, anything else 10.
+
+### The factory interface has four slots, and none of them makes a padspk reader
+
+A full-image sweep of every instruction referencing displacement `+0x430`, `lea`
+address-of forms included, finds **50 distinct instructions and not one creator**. Most are
+other structures that happen to share the offset — `0x213CC3` writes a `0x30`-byte
+self-referencing sentinel whose `+0x418` is a byte flag, and `0x2E4A7B` / `0x2E4BED` write
+`0xF`, which is `std::string` SSO capacity.
+
+The destructor at `0x21AC40` settles what the factory vtable's slots are, and the answer
+corrects an earlier note in this document as well as one reasonable guess:
+
+```
+factory non-null:
+  0x21ac59  call [factory_vt + 0x28](factory, reader from +0x420)   ; audio
+  0x21ac78  call [factory_vt + 0x28](factory, reader from +0x418)   ; video
+  0x21aca0  call [factory_vt + 0x28](factory, reader from +0x428)   ; haptic
+            +0x430 is NOT released through the factory
+factory null (0x21acb0), the fallback:
+  0x21acbb  call [reader_vt + 8] on +0x420
+  0x21acd8  call [reader_vt + 8] on +0x418
+  0x21acf5  call [reader_vt + 8] on +0x428
+  0x21ad12  call [reader_vt + 8] on +0x430   <-- only here
+```
+
+So `factory_vt + 0x28` is **`destroyReader`**, and it is called — three times, for exactly
+the three readers the factory creates. It is not an uncalled padspk creator. The factory
+interface in use is four slots:
+
+```
++0x10 createVideo   +0x18 createAudio   +0x20 createHaptic   +0x28 destroyReader
+```
+
+The asymmetry in the destructor is the real tell, and it is sharper than "no creator
+exists". The factory path releases exactly what the factory made and deliberately skips
+`+0x430`; only the no-factory fallback touches it. Whoever wrote this knew `+0x430` would
+never hold a factory-created reader.
+
+That has a consequence worth stating plainly: a cloud host that does emit types 6-9 cannot
+be doing it through *this* factory interface. Either its factory carries a fifth slot, or
+the cloud build is not this binary. The corpus cannot distinguish those, since the factory
+vtable at `0x52E590` is zero-filled in the file and populated at runtime, and the setter
+`0x225930` has no static callers or pointer references at all.
+
+### Capability ids actually used
+
+Two independent sweeps agree: `1-7, 9-11, 13-15, 17-18`. **There is no capability-8 check
+anywhere in the image.** Feature 10 (padspk) is queried exactly once, at `0x21BFDC`, in the
+grant path — never in the reader path.
+
+### CTRL channel: nothing reaches reader creation
+
+Jump table at `0x4F30C8`, signed rel32 relative to the table base, dispatched at `0x36CD3`
+(`movsxd rax,[r13+rax*4]; add rax,r13; jmp rax`) indexed by `type - 8`; types above `0x1FD`
+compared separately at `0x36D3D`.
+
+| CTRL type | handler | what it is |
+|---|---|---|
+| `0x11` | `0x36F69` -> parser `0x3E370` -> `0x32A00` | platform identification, **not** a capability mask: writes `[obj+0x2F58]`, selects Unknown / PS4 / Android / PS5 / DWC / Windows / Mac / iOS from `[obj+0x2FD8]` |
+| `0x13` | `0x37066` | DualSense feature index/value; chiaki's `0x40` maps to invalid `0xFF` |
+| `0x910` | separate compare | display devices |
+
+None touch `+0x430`, `+0x17C0` or `+0x6DC`. Capability flags at `session+0x6DC` have a
+single store, at `0x21B72D` inside `0x21B720`, which is vtable-dispatched with no static
+references.
+
+### Where that leaves the two transports
+
+| transport | grant (6-9 in STREAMINFO) | emission | status |
+|---|---|---|---|
+| local Remote Play | works — client authors the launchspec | never — no padspk reader is ever created | closed on stock firmware |
+| PS Plus cloud | not granted to a third-party client; first-party sessions do get it | first-party captures carry real audio | open, allocator-side |
+
+Local Remote Play is closed at the instruction level. Cloud is the only transport where the
+feature exists end to end, and the remaining lever is whatever makes the allocator write a
+padspk channel block into the sealed launchspec.
 
 ---
 
@@ -1317,4 +1435,9 @@ host    0x169910  feature predicate             0x21d5a0  declareChannel
 daemon  0xb4320  output destinations (7)       0x1a290   its indexer
         0xb4370  device/port types             0xb43a0   bus types (EXTRA_PAD0-3 at 9-12)
         0xa4bfc  kind -> name-table jump       0x1d4d0   port info builder
+grant   session+0x1D8  channel-name list     0x21bc50  iterates it
+        0x21d5a0  per-channel defaults        0x205040  launchspec normalizer
+        0x1783e0  JSON remove-member          0x52e590  factory vtable (zero in file)
+ctrl    0x4f30c8  CTRL jump table             0x36cd3   its dispatch
+        0x36f69   type 0x11 platform ident    0x37066   type 0x13 DualSense feature
 ```

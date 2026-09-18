@@ -884,6 +884,54 @@ the cloud build is not this binary. The corpus cannot distinguish those, since t
 vtable at `0x52E590` is zero-filled in the file and populated at runtime, and the setter
 `0x225930` has no static callers or pointer references at all.
 
+### Why a lane can be advertisable and unfillable in the same binary
+
+This deserves answering rather than restating, because the objection is a good one: if
+padspk were not supported, why can the host advertise it at all? Something must be there.
+
+Something *is* there — the whole vocabulary. What is not there is the capture, and the
+split falls on a layer boundary rather than being an oversight.
+
+**The protocol layer is shared and complete.** `0x1E69D0`, the channel-name list at
+`session+0x1D8`, `0x21BC50`, `0x21D5A0`, the capability table at `0x4F65F0`, the lane-name
+arrays at `0x53A8A8` and `0x53B2A8` — all of it knows padspk as a first-class lane kind,
+in the same order and value space as main, voice and haptic. That is one Takion stack
+serving remote play, PSNow and cloud, which is also why backwards compatibility with
+PS4-era requests holds: it lives in this layer. The strongest single piece of evidence for
+the sharing is that `gaikai-player.sprx` is **byte-identical** under NPXS40074 and
+NPXS40099 (md5 `92f5af67…`). One client binary, both transports.
+
+**The capture layer is per-build and bound to the host's audio stack.** It is the AvCap
+reader, and the evidence that it is a separate concern is positive, not merely absent:
+
+- **The destructor is asymmetric on purpose.** At `0x21AC40`, when the factory is present
+  it destroys exactly `+0x420`, `+0x418` and `+0x428` through `factory_vt+0x28` and
+  **skips `+0x430`**. Only the factory-null fallback at `0x21ACB0` touches `+0x430`, at
+  `0x21AD12`. Code that merely forgot to create a reader would not also know to leave that
+  slot out of the factory teardown.
+- **Readers come from outside the binary.** The factory vtable at `0x52E590` is zero-filled
+  in the file and populated at runtime, and its setter `0x225930` has no static callers or
+  pointer references anywhere. This image does not know what supplies its readers.
+- **The sweep is complete, and clean.** Twelve stores to `+0x430` exist in the whole image;
+  all twelve are now classified and none installs a reader — three `add` on a stats struct
+  at `0x6DC3D`/`0x6DCC4`/`0x6EB67`, a timestamp at `0x29ECF7`, `std::string` SSO capacity
+  at `0x2E4A7B`/`0x2E4BED`, a `0x30`-byte sentinel at `0x213CC3`, an unrelated class at
+  `0x2EDC87`, a stack slot at `0x25A7FB`, and three zeroing cleanups. There is also no
+  setter-shaped store (`mov [rdi+0x430], rsi`) for it, though such stores exist for other
+  classes' `+0x420` and `+0x428` at `0x2EDCA7` and `0x2EDE16`, and for the factory itself
+  at `0x225930`.
+
+So the honest reading is not "padspk is unsupported". It is that **the host that emits
+types 6-9 is not this image** — same lineage, same protocol layer, a capture layer this
+build does not carry. Advertising is protocol; filling is platform. A binary can do the
+first without the second, and this one does.
+
+**What would overturn this**, cheaply: another firmware's `NPXS40102/eboot.bin`. The corpus
+holds exactly one version of the local host — the copy under `PS5-2/system/vsh/app/` and
+the one in the `fw3` tree are byte-identical, SHA-256 `e83f6352…9d35ae5`. A single
+different build with an install at `+0x430` would replace this section outright. Until
+then, one image is one data point.
+
 ### Capability ids actually used
 
 Two independent sweeps agree: `1-7, 9-11, 13-15, 17-18`. **There is no capability-8 check

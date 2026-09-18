@@ -801,7 +801,125 @@ this JSON reaches it.
 
 ---
 
-## 8. What this branch implements
+## 8. The console side: why an allocated lane stays silent
+
+Everything above is the streaming stack. This section is the audio stack underneath it,
+read out of `/system/priv/lib/libSceAudioSystem.sprx` — the real audio daemon (§"Where the
+daemon actually is"). It answers the question the rest of the document kept deferring:
+the channels are allocated and nothing plays through them.
+
+### The console already has pad-speaker capture
+
+The daemon carries, as plain strings:
+
+```
+AudioAvCapMgrShmPadSpk          /evf_acap.padspk
+AudioAvCapMgrShmHapticFull      AudioAvCapMgrShmHapticShare
+AudioAvCapMgrShmFull            AudioAvCapMgrShmShare       AudioAvCapMgrShmPart
+sceAudioOut2AvCapBufferInit
+sceAudioOutConnectRemote  /  DisconnectRemote  /  ConnectShare  /  ConnectCustom
+sceAudioOutServerBusConnect  /  BusDisconnect  /  BusSetIoParam
+```
+
+So the capture side of pad speaker exists on the console, by name, with its own shared
+memory region and its own event flag, sitting beside the haptic ones. This is not a
+feature that has to be invented — it has to be connected.
+
+### The enums, recovered
+
+The daemon names things for its JSON/diagnostic output through pointer tables that the
+relocation data makes readable. Three tables matter.
+
+**Output destinations** (`0xb4320`, 7 entries, indexed directly at `0x1a290`):
+
+```
+0 TV        1 HP0       2 HP1       3 HP2
+4 HP3       5 REC       6 REMOTE_PLAY
+```
+
+**This is the `output` field of `SceAudioOutPortState`** (§6), and it closes the open
+question there. libSceAudioOut masks that field with `0x7f` at `0x18320` — exactly seven
+bits, exactly these seven names — so `output` is a bitmask over this list:
+
+```
+bit 0  0x01  TV            bit 4  0x10  HP3
+bit 1  0x02  HP0           bit 5  0x20  REC
+bit 2  0x04  HP1           bit 6  0x40  REMOTE_PLAY
+bit 3  0x08  HP2           bit 7  0x80  cleared when port->+0x754 is set; unnamed
+```
+
+The rules read earlier out of libSceAudioOut now make sense rather than being arbitrary:
+`output == 0` means no destination, so not live; bit 0 implying bit 1 is TV implying HP0;
+and the voice case forcing the low three bits to 3 is forcing `TV|HP0`.
+
+**Device / port types** (`0xb4370`, reached for kinds 1-4 via the jump table at `0xa4bfc`):
+
+```
+HEADPHONE   PADSPK   VIBRATION   VOICE(PADSPK)   VIBRATION_VR
+```
+
+`VOICE(PADSPK)` as a single label is the daemon agreeing with libSceAudioOut, which
+handles port types 2 (voice) and 4 (pad speaker) in one branch at zero volume (§6), and
+with the `audioSettings` block where padspk is voice field for field (§7).
+
+**Bus types** (`0xb43a0`, kind 5; kind 6 enters the same list two entries in at `0xb43b0`):
+
+```
+0 REC    1 GLS    2 REMOTE    3 SHARE
+4 VIBRATION0  5 VIBRATION1  6 VIBRATION2  7 VIBRATION3
+8 EXTRA_VOICE
+9 EXTRA_PAD0  10 EXTRA_PAD1  11 EXTRA_PAD2  12 EXTRA_PAD3
+```
+
+**`EXTRA_PAD0` through `EXTRA_PAD3`.** Four buses, one per controller, beside four
+vibration buses and an extra voice bus. That is the console-side counterpart of channels
+6-9, named and enumerated, in the daemon, today.
+
+### What this says about the silence
+
+The chain a pad-speaker sample has to travel is now visible end to end, and the streaming
+half of it is not where it breaks:
+
+```
+game writes audio-out port, type 4 (PADSPK)
+  -> daemon routes it by the port's output bitmask
+       bit 6 REMOTE_PLAY set?  -> into the capture path
+       otherwise               -> out to the physical controller over MBUS
+  -> EXTRA_PADn bus  ->  AudioAvCapMgrShmPadSpk  ->  /evf_acap.padspk
+  -> AvCap padspk consumer (host +0x430)  ->  readFrame  ->  wire
+  -> channel 6+n, declared and accepted   <- this is where the work so far ends
+```
+
+Declaring channels 6-9 and passing both gates gets the right-hand end of that chain built.
+It does not set `output` bit 6 on anything, does not connect an `EXTRA_PADn` bus, and does
+not cause `sceAudioOutConnectRemote` to be called for a pad-speaker port. Nothing in the
+negotiated channel set reaches back into the daemon. That is consistent with lanes that
+allocate cleanly and carry nothing: the far end of the pipe is built, and the near end is
+still pointed at the controller.
+
+Which makes `AUDIOSTATE` `PORTSTATES` the interesting message again, and for a concrete
+reason rather than a structural one. It is the client telling the host the state of its
+audio output ports, `output` bitmask included — and `output` bit 6 is `REMOTE_PLAY`.
+
+### Still missing, precisely
+
+Naming the bits does not by itself say who sets them. The write side is
+`sceAudioOut2IpmiMbusSetPortConnections` / `SetPortStatuses`, which libSceAudioOut
+implements as thin IPMI wrappers — and `libSceMbus` is in libSceAudioOut's needed-library
+list, confirmed in its dynamic strings alongside `libSceIpmi`. `libSceMbus.sprx` decides
+whether a type-4 port's audio goes to the controller, to a capture bus, or to both. It
+remains the top of the file list, now for a sharper reason than before.
+
+One thing ruled out along the way: the `spark.*` keys in libSceAudioOut
+(`spark.vid`, `spark.pid`, `spark.interface`, `spark.config`, `spark.altsetting`,
+`spark.endpoint`, `spark.padTo` = `0x800`, `spark.reset`, `spark.cap` = `0x40`,
+`spark.enable`, `spark.outputFile`, plus a `sparkuplus.*` set) are a libusb transport for a
+wired pad speaker, not a routing switch. `spark.padTo` pads USB transfers to 2048 bytes; it
+has nothing to do with where pad audio is sent.
+
+---
+
+## 9. What this branch implements
 
 | commit | content |
 |---|---|
@@ -839,7 +957,7 @@ in the environment this was written in, so the Opus decode path is uncompiled.
 
 ---
 
-## 9. What is left
+## 10. What is left
 
 Two things, in order.
 
@@ -856,10 +974,13 @@ this and bounded the rest:
 
 - **Settled:** the legal port types, and that `volume` reads `0xffff` for every port type
   except the pad speaker — which is itself a usable signal.
-- **Still open:** the `output` and `flag` constant values. These do not live in
-  libSceAudioOut at all; it receives them from the audio daemon over IPC and only
-  post-processes them. What the module does give is their *rules* (bit 0 implies bit 1;
-  voice plus bit 2 forces the low three bits to 3).
+- **Answered since (§8):** the `output` bit names, recovered from libSceAudioSystem's own
+  diagnostic tables — `TV, HP0, HP1, HP2, HP3, REC, REMOTE_PLAY` for bits 0-6, which is
+  why libSceAudioOut masks the field with `0x7f`. **Bit 6, `0x40`, is `REMOTE_PLAY`.**
+- **Still open:** the `flag` constant values, and — more importantly — who *sets* `output`
+  bit 6 for a pad-speaker port. That write side is `sceAudioOut2IpmiMbusSetPortConnections`
+  / `SetPortStatuses`, thin IPMI wrappers over `libSceMbus`, which is still the top file
+  on the list.
 
 ### Where the daemon actually is
 
@@ -928,7 +1049,7 @@ than failing silently.
 
 ---
 
-## 10. The cloud server is this same binary
+## 11. The cloud server is this same binary
 
 Worth establishing before the file list, because it changes what is worth asking for.
 
@@ -983,7 +1104,7 @@ same protocol — on the client they are the same file.
 
 ---
 
-## 11. Firmware files still needed
+## 12. Firmware files still needed
 
 Checked against the FTP listing of a live console (`ps5_filelist.txt`, 11 499 paths).
 Every path below was verified to exist in that listing, so each is pullable as written.
@@ -1149,7 +1270,7 @@ lead the two halves of the list above.
 
 ---
 
-## 12. Reproducing the analysis
+## 13. Reproducing the analysis
 
 Tooling used was a small Python harness over `capstone`, with segment maps taken from each
 binary's program headers (`readelf -l`), since neither binary has section headers.
@@ -1193,4 +1314,7 @@ host    0x169910  feature predicate             0x21d5a0  declareChannel
         0x22faa7  accepted types {5,6,7,8}      0x2222cc  haptic readFrame (vtable+0x20)
         0x2228b0  padspk readFrame              0x222891  the null test padspk dies on
         0x4f65f0  capability jump table (12)    frame types: 2 haptic, 3 padspk
+daemon  0xb4320  output destinations (7)       0x1a290   its indexer
+        0xb4370  device/port types             0xb43a0   bus types (EXTRA_PAD0-3 at 9-12)
+        0xa4bfc  kind -> name-table jump       0x1d4d0   port info builder
 ```

@@ -594,15 +594,46 @@ it, all inside the audio thread `0x221b80`: two pass literal ids (`0` at `0x2235
 at `0x223567`) and four pass `0x1e69d0(name, padIndex)` — that is, ids that can be
 `2..5` or `6..9`.
 
-**What this does not yet establish.** The obvious reading — that the host computes
-per-controller frames and then drops them at `0x223a93` — requires knowing which lane each
-of those four sites belongs to, and code layout cannot answer it here. The compiler has
-interleaved basic blocks across lanes: the block at `0x2234f0`, which sits *after* the
-padspk error string at `0x223349`, tests `mixToMain` and branches back to `0x221ea6` in
-the main section, then submits to ids 0 and 1. Proximity to a lane's error string proves
-nothing about section membership in this function. Pinning the four callers needs the
-name string each one passes to `0x1e69d0` traced back to its source, which is the next
-step on this thread.
+**All seven callers, identified.** Each computed-id site builds a `std::string` in a
+stack local from one of the host's name globals, then calls `0x1e69d0(name, padIndex)`:
+
+| call site | name string | pad index | channel ids |
+|---|---|---|---|
+| `0x22251e` | `"haptic"` (`0x53b308`, copied at `0x222420`) | `r13d`, `0..3` | 2-5 |
+| `0x222d59` | `"padspk"` (`0x53b2e8`, copied at `0x222ad8`) | `r13d`, `0..3` | 6-9 |
+| `0x222f5f` | `"padspk"` (copied at `0x222b77`) | `r13d`, `0..3` | 6-9 |
+| `0x2230a9` | `"padspk"` (copied at `0x222fcf`) | `r13d`, `0..3` | 6-9 |
+| `0x223144` | — | — | literal `0` |
+| `0x223540` | — | — | literal `0` |
+| `0x22356d` | — | — | literal `1` |
+
+The haptic site loops `inc r13d; cmp r13d, 4; je` — four pads, exactly as §7's channel
+loop builds four objects. The three padspk sites are variants rather than derivations of
+main: the last main/voice pair at `0x223540`/`0x22356d` submits the same buffer twice, the
+second time offset by `[rbp-0x1e8]` with `ecx = 0x800`, which looks like a second chunk or
+a redundancy copy, and the padspk sites have the same shape.
+
+**The tension this leaves.** Every per-controller submission — one haptic, three padspk —
+calls `0x2239c0`, and `0x2239c0` rejects exactly the lanes those sites feed, because
+`+0x38` is false for both. The literal-id sites (0, 0, 1) pass. Checked and re-checked:
+`[rbp-0x121]` is written once and read once with no overlapping store anywhere in
+`0x21b810`; `r14` holds `r13+0x17e8` from `0x21bcbc` with no reassignment, so setup and
+`submitFrame` use the same map; and `[node+0x28]` is the map's value slot, null-checked at
+`0x223a71` before the `+0x38` test.
+
+Two readings survive, and they are not equally cheap to test:
+
+1. `0x2239c0` is a secondary tap — a local mixdown, recorder or metrics path that main and
+   voice take and the per-controller lanes deliberately skip — and haptic leaves the host
+   by a route this function does not show. The haptic block calls nothing else with the
+   frame except the consumer's `readFrame` at `0x2222cc`, so that route would have to be
+   outside `0x221b80` entirely.
+2. `+0x38` means something narrower than "this channel is live", and the name is wrong.
+
+What decides it is haptics, not padspk: haptics demonstrably reaches a remote play client
+today, so following a real haptic frame from `readFrame` to the wire says which of the two
+holds. That is a better next step than more static reading, and it needs a host, not
+another binary.
 
 ### Is there a voice consumer to repurpose?
 

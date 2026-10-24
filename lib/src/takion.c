@@ -1,5 +1,6 @@
 #include "chiaki/feedback.h"
 #include <chiaki/takion.h>
+#include <chiaki/audio.h>
 #include <chiaki/congestioncontrol.h>
 #include <chiaki/random.h>
 #include <chiaki/gkcrypt.h>
@@ -1726,7 +1727,10 @@ static void takion_handle_packet_av(ChiakiTakion *takion, uint8_t base_type, uin
 		return;
 	}
 
-	if((takion->disable_audio_video & CHIAKI_AUDIO_DISABLED) && (base_type == TAKION_PACKET_TYPE_AUDIO) && !packet.is_haptics)
+	// Muting the stream's audio output must not silence the controller feedback lanes:
+	// haptics and pad speaker are per-controller, not part of the main mix.
+	if((takion->disable_audio_video & CHIAKI_AUDIO_DISABLED) && (base_type == TAKION_PACKET_TYPE_AUDIO)
+			&& !packet.is_haptics && !chiaki_audio_channel_is_padspk(packet.audio_channel))
 		return;
 
 	if(packet.is_video)
@@ -1923,7 +1927,9 @@ static ChiakiErrorCode av_packet_parse(bool v12, ChiakiTakionAVPacket *packet, C
 
 	if(v12 && !packet->is_video)
 	{
-		packet->is_haptics = *av == 0x02;
+		// Flat Takion audio channel id: main 0, voice 1, haptic 2+pad, padspk 6+pad.
+		packet->audio_channel = *av;
+		packet->is_haptics = chiaki_audio_channel_is_haptic(packet->audio_channel);
 		av += 1;
 		av_size -= 1;
 	}
@@ -1932,6 +1938,27 @@ static ChiakiErrorCode av_packet_parse(bool v12, ChiakiTakionAVPacket *packet, C
 	packet->data_size = av_size;
 
 	return CHIAKI_ERR_SUCCESS;
+}
+
+CHIAKI_EXPORT bool chiaki_takion_protocol_feature_supported(uint8_t version, ChiakiTakionFeature feature)
+{
+	if(version < CHIAKI_TAKION_PROTOCOL_VERSION_MIN || version > CHIAKI_TAKION_PROTOCOL_VERSION_MAX)
+		return false;
+
+	// Feature count per protocol version, indexed by version - 9. A feature is
+	// available when its id is below the count for the negotiated version.
+	static const uint8_t feature_count[] = { 5, 6, 7, 8, 8, 8, 13, 13, 13, 16, 17, 19 };
+	// Versions 10 through 12 additionally mask out some ids below their own count,
+	// so the count alone is not sufficient for them. 0 means "no extra mask".
+	static const uint8_t low_mask[] = { 0, 0x2f, 0x5f, 0xdf, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+	size_t idx = (size_t)(version - CHIAKI_TAKION_PROTOCOL_VERSION_MIN);
+	unsigned f = (unsigned)feature;
+	if(f >= feature_count[idx])
+		return false;
+	if(low_mask[idx] && !((low_mask[idx] >> f) & 1))
+		return false;
+	return true;
 }
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_v9_av_packet_parse(ChiakiTakionAVPacket *packet, ChiakiKeyState *key_state, uint8_t *buf, size_t buf_size)

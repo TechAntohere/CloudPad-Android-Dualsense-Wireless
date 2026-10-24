@@ -20,6 +20,7 @@ import androidx.lifecycle.MutableLiveData
 import com.metallic.chiaki.common.LogManager
 import com.metallic.chiaki.discovery.ConsoleSleepIntent
 import com.metallic.chiaki.lib.*
+import com.metallic.chiaki.stream.PadSpeakerAudioRouter
 
 sealed class StreamState
 object StreamStateIdle: StreamState()
@@ -60,6 +61,8 @@ class StreamSession(connectInfo: ConnectInfo, val logManager: LogManager, val lo
 	val triggerEffectsState: LiveData<TriggerEffectsEvent> get() = _triggerEffectsState
 
 	var hapticsFrameCallback: ((ByteArray, Long) -> Unit)? = null
+	/** (controllerIndex, mono s16 48 kHz PCM, native CLOCK_BOOTTIME ns) */
+	var padSpeakerFrameCallback: ((Int, ByteArray, Long) -> Unit)? = null
 	var ledColorCallback: ((LedColorEvent) -> Unit)? = null
 	var playerIndexCallback: ((Int) -> Unit)? = null
 	var hapticIntensityCallback: ((Int) -> Unit)? = null
@@ -345,6 +348,7 @@ class StreamSession(connectInfo: ConnectInfo, val logManager: LogManager, val lo
 			// race here either.
 			onFullyStopped?.invoke()
 		}
+		PadSpeakerAudioRouter.setEnabled(false)
 		_state.value = StreamStateIdle
 		//surfaceTexture?.release()
 	}
@@ -365,6 +369,7 @@ class StreamSession(connectInfo: ConnectInfo, val logManager: LogManager, val lo
 		Log.i("StreamSession", "release")
 		shutdown()
 		hapticsFrameCallback = null
+		padSpeakerFrameCallback = null
 		ledColorCallback = null
 		playerIndexCallback = null
 		hapticIntensityCallback = null
@@ -411,6 +416,11 @@ class StreamSession(connectInfo: ConnectInfo, val logManager: LogManager, val lo
 		if(session != null)
 			return
 		_state.value = StreamStateConnecting
+
+		// The lane is only fed when the host accepts the advertisement, so turning the
+		// router on here costs nothing if it does not: with no frames arriving it just
+		// holds the speaker FIFO's silence frame.
+		PadSpeakerAudioRouter.setEnabled(connectInfo.enablePadSpeaker)
 
 		val duid = connectInfo.duid
 		val hasPsnToken = !connectInfo.psnToken.isNullOrEmpty()
@@ -639,6 +649,9 @@ class StreamSession(connectInfo: ConnectInfo, val logManager: LogManager, val lo
 				mainHandler.post { _ledColorState.value = event }
 			}
 			is PlayerIndexEvent -> {
+				// The host keys the padspk lanes on the same 0-based local controller
+				// index, so follow it rather than assuming pad 0.
+				PadSpeakerAudioRouter.primaryControllerIndex = event.playerIndex.coerceIn(0, 3)
 				val cb = playerIndexCallback
 				btHandler.post { cb?.invoke(event.playerIndex) }
 				mainHandler.post { _playerIndexState.value = event.playerIndex }
@@ -665,6 +678,18 @@ class StreamSession(connectInfo: ConnectInfo, val logManager: LogManager, val lo
 				val frameData = event.data
 				val nativeElapsedRealtimeNs = event.nativeElapsedRealtimeNs
 				hapticsHandler.post { cb?.invoke(frameData, nativeElapsedRealtimeNs) }
+			}
+			is PadSpeakerFrameEvent -> {
+				// Same reasoning as haptics: the Opus encode and the speaker FIFO push
+				// must not run on the native stream thread.
+				val cb = padSpeakerFrameCallback
+				val controllerIndex = event.controllerIndex
+				val frameData = event.data
+				val nativeElapsedRealtimeNs = event.nativeElapsedRealtimeNs
+				hapticsHandler.post {
+					PadSpeakerAudioRouter.onPadSpeakerFrame(controllerIndex, frameData)
+					cb?.invoke(controllerIndex, frameData, nativeElapsedRealtimeNs)
+				}
 			}
 			is AutoRegistEvent -> Log.i("StreamSession", "EVENT: AutoRegist host=${event.host.serverNickname}")
 			is HolepunchEvent -> Log.i("StreamSession", "EVENT: Holepunch")

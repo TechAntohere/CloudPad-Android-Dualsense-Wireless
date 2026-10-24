@@ -64,7 +64,10 @@ object CloudConnectInfoBuilder
 			cloudGameIdentifier = gameIdentifier,
 			cloudGameName = session.gameName,
 			cloudOwnedEntitlementId = session.entitlementId,
-			cloudGameProductId = gameProductId
+			cloudGameProductId = gameProductId,
+			// The pad speaker lane only exists on cloud hosts, so it is only ever
+			// requested from here. The lib applies the remaining host-side conditions.
+			enablePadSpeaker = preferences.controllerPadSpeakerLane
 		)
 	}
 }

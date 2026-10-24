@@ -987,6 +987,19 @@ class Preferences(context: Context)
 		get() = sharedPreferences.getBoolean(controllerSpeakerLiveAudioKey, false)
 		set(value) { sharedPreferences.edit().putBoolean(controllerSpeakerLiveAudioKey, value).apply() }
 
+	/**
+	 * Play the host's dedicated pad speaker lane (padspk) on the controller speaker.
+	 *
+	 * Cloud sessions only: retail Remote Play declares the padspk channels but never
+	 * creates a consumer for them, so there is nothing to play there. Unlike
+	 * [controllerSpeakerLiveAudio] this is the audio the game actually meant for the
+	 * controller speaker, on its own channel, rather than a copy of the main mix.
+	 */
+	val controllerPadSpeakerLaneKey = "controller_pad_speaker_lane"
+	var controllerPadSpeakerLane
+		get() = sharedPreferences.getBoolean(controllerPadSpeakerLaneKey, false)
+		set(value) { sharedPreferences.edit().putBoolean(controllerPadSpeakerLaneKey, value).apply() }
+
 	/** Route controller audio to the 3.5mm headphone jack instead of the speaker. */
 	val controllerHeadphoneOutputKey = "controller_headphone_output"
 	var controllerHeadphoneOutput

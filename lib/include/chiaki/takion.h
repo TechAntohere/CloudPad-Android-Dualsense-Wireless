@@ -40,6 +40,12 @@ typedef struct chiaki_takion_av_packet_t
 	bool uses_nalu_info_structs;
 	bool is_video;
 	bool is_haptics;
+	/**
+	 * Takion audio channel id this packet belongs to (CHIAKI_AUDIO_CHANNEL_*).
+	 * Only meaningful for audio packets on protocol v12; older protocols carry no
+	 * channel byte and are always treated as the main channel.
+	 */
+	uint8_t audio_channel;
 	ChiakiSeqNum16 unit_index;
 	uint16_t units_in_frame_total; // source + units_in_frame_fec
 	uint16_t units_in_frame_fec;
@@ -259,6 +265,73 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *
 #define CHIAKI_TAKION_V9_AV_HEADER_SIZE_AUDIO 0x12
 
 CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_v9_av_packet_parse(ChiakiTakionAVPacket *packet, ChiakiKeyState *key_state, uint8_t *buf, size_t buf_size);
+
+/**
+ * Takion protocol feature ids.
+ *
+ * Both ends gate optional behaviour through one shared predicate: each protocol
+ * version carries a feature count, and a feature is available when its id is below
+ * that count. The counts are 5, 6, 7, 8, 8, 8, 13, 13, 13, 16, 17, 19 for versions 9
+ * through 20 (versions 10-12 additionally mask out a couple of low ids), and a
+ * version above 20 is rejected outright rather than treated as newer.
+ *
+ * Only the ids this code needs are named. The two that matter for the pad speaker:
+ * PADSPK gates both the padspk channel declarations and the entire AUDIOSTATE
+ * message, and AUDIO_CHANNELNUM gates the CHANNELNUM variant of it specifically.
+ */
+typedef enum chiaki_takion_feature_t
+{
+	/** Haptics channels. Available from version 12, which is why they already work. */
+	CHIAKI_TAKION_FEATURE_HAPTIC = 7,
+	/**
+	 * Pad speaker channels, and with them the whole AUDIOSTATE message -- the host
+	 * refuses to accept any audio state update without this feature, so a session
+	 * that lacks it can have the padspk channels allocated and still never be able to
+	 * ask for them to be fed. Available from version 15.
+	 */
+	CHIAKI_TAKION_FEATURE_PADSPK = 10,
+	/** AUDIOSTATE type CHANNELNUM. Available from version 18. */
+	CHIAKI_TAKION_FEATURE_AUDIO_CHANNELNUM = 15,
+	/**
+	 * An audio port mask wider than 8 bits. Without it the client clamps the mask it
+	 * sends to 0xff. Available from version 19.
+	 */
+	CHIAKI_TAKION_FEATURE_AUDIO_WIDE_PORT_MASK = 16,
+} ChiakiTakionFeature;
+
+/** Lowest protocol version carrying any feature table at all. */
+#define CHIAKI_TAKION_PROTOCOL_VERSION_MIN 9
+
+/**
+ * Whether a Takion protocol version carries a given feature, by the same table both
+ * ends of the connection use. Versions outside [9, 20] carry nothing.
+ */
+CHIAKI_EXPORT bool chiaki_takion_protocol_feature_supported(uint8_t version, ChiakiTakionFeature feature);
+
+/** Takion protocol version whose feature table the host caps out at. */
+#define CHIAKI_TAKION_PROTOCOL_VERSION_MAX 20
+
+/**
+ * AV header sizes per Takion protocol version, as the host's own lookup tables give
+ * them. Indexed by version - 9, i.e. entry 0 is version 9 and entry 11 is version 20.
+ *
+ * Versions 9 and 12 agree with the CHIAKI_TAKION_V9_/V12_ constants below, which is
+ * what makes the rest of the row trustworthy:
+ *
+ *   version : 9   10  11  12  13  14  15  16  17  18  19  20
+ *   base    : 11  11  11  11  11  11  11  11  11  11  11  19
+ *   audio   : 18  18  19  19  19  19  20  20  20  20  20  28
+ *   video   : 23  23  23  23  23  23  23  23  23  23  23  31
+ *
+ * Reading that: versions 15-19 differ from version 12 by exactly one extra byte, and
+ * it is in the audio-specific part of the header -- base and video are unchanged.
+ * Version 20 instead adds 8 bytes to the common prefix, which is why audio and video
+ * both grow by 8 on top of that.
+ */
+#define CHIAKI_TAKION_AV_HEADER_SIZE_TABLE_FIRST_VERSION 9
+#define CHIAKI_TAKION_AV_HEADER_SIZE_BASE_TABLE  { 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 19 }
+#define CHIAKI_TAKION_AV_HEADER_SIZE_AUDIO_TABLE { 18, 18, 19, 19, 19, 19, 20, 20, 20, 20, 20, 28 }
+#define CHIAKI_TAKION_AV_HEADER_SIZE_VIDEO_TABLE { 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 31 }
 
 #define CHIAKI_TAKION_V12_AV_HEADER_SIZE_VIDEO 0x17
 #define CHIAKI_TAKION_V12_AV_HEADER_SIZE_AUDIO 0x13

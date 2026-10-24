@@ -13,6 +13,7 @@
 #include <chiaki/remote/holepunch.h>
 #include <chiaki/base64.h>
 #include <chiaki/opusencoder.h>
+#include <opus/opus.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -219,8 +220,15 @@ typedef struct android_chiaki_session_t
 	jmethodID java_session_event_trigger_intensity_meth;
 	jmethodID java_session_event_trigger_effects_meth;
 	jmethodID java_session_event_haptics_frame_meth;
+	jmethodID java_session_event_padspk_frame_meth;
 	uint32_t haptics_frames_received;
 	uint32_t haptics_frames_dropped_small;
+	uint32_t padspk_frames_received;
+	uint32_t padspk_frames_dropped_small;
+	uint32_t padspk_frames_decode_failed;
+	// One mono Opus decoder per controller: the padspk lanes are independent streams
+	// and must not share decoder state.
+	OpusDecoder *padspk_decoders[CHIAKI_AUDIO_CHANNEL_CONTROLLERS_MAX];
 	// Cached class refs for CHIAKI_EVENT_REGIST (FindClass doesn't work from native threads)
 	jclass java_target_class;
 	jmethodID java_target_from_value;
@@ -384,6 +392,118 @@ static void android_chiaki_haptics_frame(uint8_t *buf, size_t buf_size, void *us
 		return;
 	android_chiaki_emit_haptics_frame(env, session, buf, buf_size, native_elapsed_realtime_ns);
 	(*global_vm)->DetachCurrentThread(global_vm);
+}
+
+// ---------------------------------------------------------------------------
+// PS Cloud: per-controller pad speaker lanes (padspk).
+//
+// The host allocates one padspk channel per local controller and sends each as
+// raw mono s16 48 kHz PCM, alongside the haptics channels. Retail Remote Play
+// never creates a consumer for these, so this only ever carries audio on cloud
+// sessions. Frames are forwarded up to StreamSession, which feeds them to the
+// DualSense BT speaker path.
+// ---------------------------------------------------------------------------
+
+static void android_chiaki_padspk_header(ChiakiAudioHeader *header, void *user)
+{
+	AndroidChiakiSession *session = user;
+	if(!session || !header)
+		return;
+	CHIAKI_LOGI(session->log, "JNI padspk lane header: channels=%u bits=%u rate=%u frame_size=%u",
+		(unsigned int)header->channels, (unsigned int)header->bits,
+		(unsigned int)header->rate, (unsigned int)header->frame_size);
+}
+
+static void android_chiaki_padspk_frame(uint8_t controller_index, uint8_t *buf, size_t buf_size, void *user)
+{
+	AndroidChiakiSession *session = user;
+	int64_t native_elapsed_realtime_ns = android_chiaki_elapsed_realtime_nanos();
+	if(!buf || !buf_size)
+		return;
+	if(controller_index >= CHIAKI_AUDIO_CHANNEL_CONTROLLERS_MAX)
+		return;
+
+	session->padspk_frames_received++;
+	if(buf_size < 2)
+	{
+		session->padspk_frames_dropped_small++;
+		if(session->padspk_frames_dropped_small <= 8 || session->padspk_frames_dropped_small % 64 == 0)
+		{
+			CHIAKI_LOGW(session->log, "JNI dropping tiny padspk frame #%u with size=%llu",
+				(unsigned int)session->padspk_frames_dropped_small,
+				(unsigned long long)buf_size);
+		}
+		return;
+	}
+
+	// The lane is Opus, not PCM -- unlike haptics. Decode here so Kotlin only ever
+	// sees mono s16 and does not need a decoder of its own.
+	OpusDecoder *decoder = session->padspk_decoders[controller_index];
+	if(!decoder)
+	{
+		int opus_err = 0;
+		decoder = opus_decoder_create(CHIAKI_AUDIO_PADSPK_RATE, CHIAKI_AUDIO_PADSPK_CHANNELS, &opus_err);
+		if(!decoder || opus_err != OPUS_OK)
+		{
+			if(decoder)
+				opus_decoder_destroy(decoder);
+			CHIAKI_LOGE(session->log, "JNI failed to create padspk Opus decoder for pad %u: %s",
+				(unsigned int)controller_index, opus_strerror(opus_err));
+			return;
+		}
+		session->padspk_decoders[controller_index] = decoder;
+		CHIAKI_LOGI(session->log, "JNI created padspk Opus decoder for pad %u (%u ch, %u Hz)",
+			(unsigned int)controller_index,
+			(unsigned int)CHIAKI_AUDIO_PADSPK_CHANNELS, (unsigned int)CHIAKI_AUDIO_PADSPK_RATE);
+	}
+
+	int16_t pcm[CHIAKI_AUDIO_PADSPK_FRAME_SIZE * CHIAKI_AUDIO_PADSPK_CHANNELS];
+	int samples = opus_decode(decoder, buf, (opus_int32)buf_size, pcm, CHIAKI_AUDIO_PADSPK_FRAME_SIZE, 0);
+	if(samples <= 0)
+	{
+		session->padspk_frames_decode_failed++;
+		if(session->padspk_frames_decode_failed <= 8 || session->padspk_frames_decode_failed % 64 == 0)
+		{
+			CHIAKI_LOGW(session->log, "JNI padspk Opus decode failed on pad %u (#%u): %s",
+				(unsigned int)controller_index,
+				(unsigned int)session->padspk_frames_decode_failed,
+				opus_strerror(samples));
+		}
+		return;
+	}
+
+	if(session->padspk_frames_received <= 8 || session->padspk_frames_received % 256 == 0)
+	{
+		CHIAKI_LOGI(session->log, "JNI live padspk frame #%u pad=%u opus=%llu bytes -> %d samples",
+			(unsigned int)session->padspk_frames_received,
+			(unsigned int)controller_index,
+			(unsigned long long)buf_size, samples);
+	}
+
+	JNIEnv *env = attach_thread_jni();
+	if(!env)
+		return;
+	jbyteArray data = jnibytearray_create(env, (const uint8_t *)pcm,
+		(size_t)samples * CHIAKI_AUDIO_PADSPK_CHANNELS * sizeof(int16_t));
+	E->CallVoidMethod(env, session->java_session,
+					  session->java_session_event_padspk_frame_meth,
+					  (jint)controller_index,
+					  data,
+					  (jlong)native_elapsed_realtime_ns);
+	E->DeleteLocalRef(env, data);
+	(*global_vm)->DetachCurrentThread(global_vm);
+}
+
+static void android_chiaki_padspk_decoders_fini(AndroidChiakiSession *session)
+{
+	for(size_t i = 0; i < CHIAKI_AUDIO_CHANNEL_CONTROLLERS_MAX; i++)
+	{
+		if(session->padspk_decoders[i])
+		{
+			opus_decoder_destroy(session->padspk_decoders[i]);
+			session->padspk_decoders[i] = NULL;
+		}
+	}
 }
 
 static void android_chiaki_event_cb(ChiakiEvent *event, void *user)
@@ -626,6 +746,12 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 	jboolean auto_regist = E->GetBooleanField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "autoRegist", "Z"));
 	connect_info.auto_regist = auto_regist;
 
+	// Pad speaker lanes. Whether the host actually honours the request is decided in
+	// the lib (cloud only, Takion protocol 15-20, not mixing pad audio into main).
+	connect_info.enable_padspk = E->GetBooleanField(env, connect_info_obj,
+		E->GetFieldID(env, connect_info_class, "enablePadSpeaker", "Z"));
+	connect_info.padspk_mix_to_main = false;
+
 	// Cloud streaming fields (optional, null for remote play)
 	jstring service_type_string = E->GetObjectField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "serviceType", "Ljava/lang/String;"));
 	if(service_type_string)
@@ -822,6 +948,7 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 	session->java_session_event_trigger_intensity_meth = E->GetMethodID(env, session->java_session_class, "eventTriggerIntensity", "(I)V");
 	session->java_session_event_trigger_effects_meth = E->GetMethodID(env, session->java_session_class, "eventTriggerEffects", "(I[BI[B)V");
 	session->java_session_event_haptics_frame_meth = E->GetMethodID(env, session->java_session_class, "eventHapticsFrame", "([BJ)V");
+	session->java_session_event_padspk_frame_meth = E->GetMethodID(env, session->java_session_class, "eventPadSpeakerFrame", "(I[BJ)V");
 
 	// Cache class refs for CHIAKI_EVENT_REGIST (FindClass won't work from native threads)
 	session->java_target_class = E->NewGlobalRef(env, E->FindClass(env, BASE_PACKAGE"/Target"));
@@ -887,6 +1014,18 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 		CHIAKI_LOGI(log, "JNI attached raw haptics sink");
 	}
 
+	// Pad speaker lanes. Attaching the sink is also what makes the lib advertise the
+	// padspk channels, so keep it off unless the feature is actually requested.
+	if(connect_info.enable_padspk)
+	{
+		ChiakiPadSpeakerSink padspk_sink = { 0 };
+		padspk_sink.user = session;
+		padspk_sink.header_cb = android_chiaki_padspk_header;
+		padspk_sink.frame_cb = android_chiaki_padspk_frame;
+		chiaki_session_set_padspk_sink(&session->session, &padspk_sink);
+		CHIAKI_LOGI(log, "JNI attached pad speaker sink");
+	}
+
 beach:
 	if(!session && log)
 	{
@@ -907,6 +1046,7 @@ JNIEXPORT void JNICALL JNI_FCN(sessionFree)(JNIEnv *env, jobject obj, jlong ptr)
 	CHIAKI_LOGI(session->log, "Shutting down JNI Session");
 	chiaki_opus_encoder_fini(&session->opus_encoder);
 	chiaki_session_fini(&session->session);
+	android_chiaki_padspk_decoders_fini(session);
 	android_chiaki_video_decoder_fini(&session->video_decoder);
 	if(session->use_opus_decoder)
 		android_chiaki_opus_decoder_fini(&session->opus_decoder);

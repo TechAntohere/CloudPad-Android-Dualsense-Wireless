@@ -1,0 +1,1573 @@
+# Pad speaker (padspk) audio on PS Cloud
+
+Working notes for the DualSense pad-speaker lane: what the protocol looks like, what
+this branch implements, what is still missing, and how to pick the work back up.
+
+Everything below was read out of PS5 firmware 12.40. Two binaries carry almost all of
+it:
+
+| role | file |
+|---|---|
+| cloud client (PS5 playing a cloud game) | `system_ex/app/NPXS40099/gaikai-player.sprx` |
+| remote play host / Takion daemon | `system/vsh/app/NPXS40102/eboot.bin` |
+
+Both are plain unencrypted x86-64 ELFs with no section headers, so addresses below are
+virtual addresses, and a disassembler needs the program headers to map them. The client
+is compiled with optimisation in places and without it in others; the unoptimised parts
+(`ProsperoAudioState`, `ProsperoAudioDecoder`) read almost like source.
+
+---
+
+## 1. The channel model
+
+The console maps a channel *kind* plus a controller index onto one flat channel id. That
+id is what travels in `AudioChannelPayload.audioChannelType` and in the per-packet
+channel byte of a v12 Takion AV audio header.
+
+```
+main          -> 0
+voice         -> 1
+haptic, pad n -> 2 + n      (2..5)
+padspk, pad n -> 6 + n      (6..9)
+                 10          = channel count / "no such channel"
+```
+
+From the client's allocator at `0x84ec0`:
+
+```c
+uint32_t audioChannelId(const std::string &kind, int padIndex) {
+    if (kind == "main")   return 0;
+    if (kind == "voice")  return 1;
+    if (kind == "haptic") return padIndex + 2;
+    if (kind == "padspk") return padIndex + 6;
+    return 10;
+}
+```
+
+This is also why chiaki's long-standing `is_haptics = (*av == 0x02)` worked: 2 is haptic
+pad 0, not a magic constant. The string table `{main, voice, padspk, haptic}` that
+appears 24x across the firmware is the kind->name array, *not* the id order — reading it
+as the enum is the easy mistake here.
+
+### Lane formats
+
+Straight out of the host's `declareChannel` at `0x21d5a0`:
+
+| lane | rate | ch | samples/frame | bytes/frame | isRawPcm | bitrate |
+|---|---|---|---|---|---|---|
+| haptic | 3000 | 2 | 30 | 120 | **true** | ~96 kbps |
+| padspk | 48000 | 1 | 480 | 960 | **false** | ~48 kbps |
+
+The two per-controller lanes are *not* alike. Haptics is raw PCM — which is why
+chiaki's haptics path can `memcpy` `int16_t` straight out of the buffer, and why its
+`buf_size != 120` check is exactly right. **padspk is Opus** and has to be decoded.
+
+The 120 is the giveaway that confirms the whole table: it matches chiaki's existing
+assertion independently. Note also that haptics' 96 kbps is exactly its raw bitrate
+(3000 x 2 x 16), while padspk's 48 kbps is nowhere near its raw 768 — a second,
+independent sign that padspk is compressed.
+
+Channel entries are 36 (`0x24`) bytes:
+
+```
++0x00 dword  audioChannelType        +0x14 dword  channels
++0x04 dword  (5)                     +0x18 dword  maxFrameDataSize
++0x08 byte   isSigned                +0x1c dword  samplesPerFrame
++0x09 byte   isRawPcm                +0x20 dword  bitrate (kbps)
++0x0c dword  sampleRate
++0x10 dword  sampleSize (bytes)
+```
+
+### Protocol schema
+
+The real fw 12.40 `takion.proto` was recovered from the embedded `FileDescriptorProto`
+at client file offset `3842416` (10755 bytes, 51 messages). Two things this tree was
+missing:
+
+```proto
+message AudioChannelPayload {
+    required uint32 audioChannelType = 1;
+    required bytes  audioHeader      = 2;
+    optional bool   isRawPcm         = 3;
+    repeated bytes  profileHeader    = 4;   // was missing
+    optional uint32 fecMode          = 5;   // was missing
+}
+```
+
+and payload type **`AUDIOSTATE = 33`** with `optional AudioStatePayload audioState = 33`,
+which the enum here stopped short of entirely (it ended at 32).
+
+---
+
+## 2. The version gate is a feature table
+
+Neither end gates on version ranges. Both use one shared predicate — client `0x2511f0`,
+host `0x169910` — where each protocol version carries a *feature count* and a feature is
+available when its id is below it.
+
+Counts for v9..v20: `5, 6, 7, 8, 8, 8, 13, 13, 13, 16, 17, 19`. Versions 10-12
+additionally mask out a few low ids (`0x2f`, `0x5f`, `0xdf`). **A version above 20 is
+rejected outright, not treated as newer** — so v23 gets nothing on this firmware.
+
+The host's version of the predicate decodes exactly. `0x169910` does
+`esi -= 9; if (esi > 0xb) return 0`, then jumps through a 12-entry table at `0x4f65f0`:
+
+| version | predicate | feature 7 (haptic) | feature 10 (padspk) |
+|---|---|---|---|
+| 9 | `feature < 5` | no | no |
+| 10 | mask `0x2f`, `feature < 6` | no | no |
+| 11 | mask `0x5f`, `feature < 7` | no | no |
+| 12 | mask `0xdf`, `feature < 8` | **yes** | no |
+| 13, 14 | `feature < 8` | yes | no |
+| 15, 16, 17 | `feature < 13` | yes | **yes** |
+| 18 | `feature < 16` | yes | yes |
+| 19 | `feature < 17` | yes | yes |
+| 20 | `feature < 19` | yes | yes |
+
+Read straight off the jump table, this is the whole story in one place: **haptic turns on
+at v12, padspk at v15.** Retail remote play negotiates v12. That is precisely why haptics
+works there today and padspk does not, and it is the 15-20 range confirmed rather than
+assumed.
+
+| feature | first version | what it gates |
+|---|---|---|
+| 6 | 11 | parsing the `audioChannel` list at all |
+| 7 | **12** | haptics |
+| 10 | **15** | padspk channels **and the entire AUDIOSTATE message** |
+| 15 | **18** | AUDIOSTATE type CHANNELNUM |
+| 16 | **19** | audio port mask wider than `0xff` |
+
+Feature 7 landing on v12 is the self-check: v12 is what this client negotiates for PS5,
+and haptics works today. Implemented as `chiaki_takion_protocol_feature_supported()`.
+
+That feature 10 gates AUDIOSTATE *as a whole* is the important part — see §4.
+
+---
+
+## 3. AV header sizes per version
+
+From the client's lookup tables (`0x251350`, `0x251370`, `0x2513c0`), indexed by
+`version - 9`:
+
+```
+version : 9   10  11  12  13  14  15  16  17  18  19  20
+base    : 11  11  11  11  11  11  11  11  11  11  11  19
+audio   : 18  18  19  19  19  19  20  20  20  20  20  28
+video   : 23  23  23  23  23  23  23  23  23  23  23  31
+```
+
+These validate against chiaki's own constants — v9 audio 18 = `V9_..._AUDIO` (0x12),
+v12 audio 19 = `V12_..._AUDIO` (0x13), video 23 = 0x17 — which is what makes the rest of
+the row trustworthy.
+
+Reading it: **v15-19 is v12 plus exactly one byte, in the audio-specific part** (base and
+video unchanged). **v20 adds 8 bytes to the common prefix**, so audio and video both grow
+by 8 on top of that. A fourth table (v15-20 only) reads `21,21,21,21,21,29` = audio + 1,
+matching chiaki's `av_header_size + 1` minimum-payload check.
+
+What the extra v15-19 audio byte *means* is not established — only its size and that it
+is in the audio-specific region.
+
+Recorded in `takion.h` as `CHIAKI_TAKION_AV_HEADER_SIZE_*_TABLE`.
+
+**ECDH:** both binaries contain exactly two curve setups, as adjacent sibling pairs:
+`secp256k1` (NID 714) and `secp521r1` / P-521 (NID 716). The client contains **no P-256
+at all** — worth noting, since `ecdh.c` here uses `prime256v1` for the cloud path. It
+evidently works at v9/v12, so this is an observation, not a known bug.
+
+---
+
+## 4. AUDIOSTATE: what the host is actually waiting for
+
+Declaring the padspk channels gets them *allocated*. It does not get them *fed*. The
+missing half is `AUDIOSTATE`, the only channel through which a client can tell the host
+that an audio port or channel is live.
+
+From `Connection::sendAudioState` at `0x2af530`:
+
+```c
+if (!capability(10 /* padspk */, takion->version)) return false;
+if (stateType == 6 /* CHANNELNUM */)
+    if (!capability(15, takion->version)) return false;
+msg->type = 0x21;  // AUDIOSTATE
+```
+
+The host drops **every** audio state update — of every type — unless the negotiated
+version carries the padspk feature. So the same version step that makes the lanes
+declarable is what makes them requestable. Channels allocated but silent is exactly what
+that produces.
+
+### Blob layouts
+
+`ProsperoAudioState` (ctor `0x31540`, poll `0x31700`, port states `0x321e0`) polls the
+client's own audio hardware, caches each result, and sends only what changed — the diff
+is what selects the type.
+
+| type | size | layout |
+|---|---|---|
+| **HRTF** (3) | 4 | the HRTF id, uint32 |
+| **FLAGS** (1) | 9 | speaker-kind byte, then two dwords |
+| **ANGLE** (2) | 64 | 16 speaker positions, two uint16 each |
+| **FULL** (0) | 73 | FLAGS' 9 bytes, then ANGLE's 64 |
+| **TVCONFIG** (4) | 188 | a dword, two 90-byte correction blocks, then 2 + 2 bytes |
+| **PORTSTATES** (5) | 33 | group byte, then that group's 32-byte port block |
+
+Three pin themselves independently: HRTF is a lone 4-byte id, TVCONFIG is 188 = exactly
+the `0xbc` buffer the client allocates for every blob, PORTSTATES is 33.
+
+All fields are **native byte order** — the client `memcpy`s straight out of the
+sceAudioOut structs rather than serialising. This is unlike the big-endian audio header.
+
+The **port availability mask** is the dword at **offset 1** of a FLAGS or FULL blob. That
+is what `sendAudioState` clamps to `0xff` without feature 16.
+
+> Quirk worth knowing: the client applies that clamp for `stateType <= 2`, which includes
+> ANGLE — but ANGLE carries no mask at offset 1, only packed positions, so clamping there
+> corrupts them. Looks like `<= 2` where `<= 1` was meant. This tree clamps only FLAGS and
+> FULL. It is client-side only, so that is strictly safer, not a compatibility risk.
+
+### PORTSTATES in detail
+
+```c
+void updatePortStates(this, uint8_t group, const int32_t handles[4], void *blob) {
+    uint8_t *state = (uint8_t*)this + 0x154 + group*32;
+    uint8_t prev[32]; memcpy(prev, state, 32); memset(state, 0, 32);
+    for (int i = 0; i < 4; i++) {
+        if (handles[i] < 0) continue;              // -1 = port not open
+        sceAudioOutGetPortState(handles[i], &st);
+        *(uint16_t*)(state + 0x00 + i*2) = st.output;
+        *(uint16_t*)(state + 0x08 + i*2) = st.volume;
+        *(uint32_t*)(state + 0x10 + i*4) = (uint32_t)st.flag;
+    }
+    if (memcmp(state, prev, 32)) {                 // ymm compare
+        blob[0] = group;
+        memcpy(blob + 1, state, 0x20);
+        sendAudioState(session, 5 /* PORTSTATES */, blob, 0x21);
+    }
+}
+```
+
+The 32-byte block is **field-major, not port-major**:
+
+```
+05 | 1111 4444 7777 aaaa | 2222 5555 8888 bbbb | 33333333 66666666 99999999 cccccccc
+^grp      4x output            4x volume                4x flag
+```
+
+The client polls **two groups of four ports** — eight total, which is what an 8-bit
+availability mask covers.
+
+---
+
+## 5. How a channel becomes a live output
+
+`ProsperoAudioDecoder::openDevice` at `0x32940` maps a channel onto a local
+`sceAudioOut` port and opens it:
+
+```c
+if (audioChannelType == 1) {                       // VOICE
+    portType = 2;  param = 1;
+    sceUserServiceGetInitialUser(&userId);
+}
+else if (isPadSpeakerChannel(audioChannelType)) {  // 0x33990
+    portType = 4;  param = 0;
+    sceUserServiceGetLoginUserIdList(&users);
+    userId = users[ padIndexForChannel(audioChannelType) ];   // 0x339c0
+}
+handle = sceAudioOutOpen(userId, portType, 0, 256, freq, param);
+```
+
+with
+
+```c
+bool isPadSpeakerChannel(int t) { return t >= 6 && t <= 9; }   // 0x33990
+int  padIndexForChannel(int t)  { return (t - 2) & 3; }        // 0x339c0
+```
+
+That `(t - 2) & 3` is one expression serving both per-pad ranges, folding haptic 2-5 and
+padspk 6-9 onto 0-3 alike.
+
+Port type **2** for the unambiguous voice branch and **0** for the default identify the
+numbering as `SceAudioOutPortType`, which puts the pad speaker at **4**.
+
+**So the full chain is:**
+
+```
+channel 6..9 declared
+  -> local output port of type 4 opened for login user (channel-2)&3
+    -> that port's state reported in an AUDIOSTATE PORTSTATES message
+      -> host produces for the lane
+```
+
+A lane is fed because a port is **open and reported**, not because a channel was
+declared.
+
+---
+
+## 6. `sceAudioOutGetPortState` and its struct
+
+The import was resolved from the binary rather than by guessing NIDs (a computed-NID
+approach failed to reproduce even known values):
+
+- stub `0x30d510` is `jmp qword ptr [rip+0xb049a]` -> GOT `0x3bd9b0`
+- the client's dynamic tables are plain ELF: `DT_STRTAB 0x3cd390`, `DT_SYMTAB 0x3d13d0`,
+  `DT_JMPREL 0x3d6fb0`
+- the JMPREL entry for that GOT slot names symbol 264: **`GrQ9s4IrNaQ#H#I`**
+
+The suffix is `NID#libraryId#moduleId` in base64url. Sorting all the client's audio
+imports that way:
+
+```
+libId 17  libSceAudioOut2   modId 8  libSceAudioOut   (15 symbols)
+libId  7  libSceAudioOut    modId 8  libSceAudioOut   ( 6 symbols)
+```
+
+**`libSceAudioOut2` is not a separate module.** Both libraries come out of one module,
+`libSceAudioOut` — which is why the console's file index lists `libSceAudioOut.sprx` and
+no `libSceAudioOut2.sprx`. (Same pattern as `libScePosix`/`libkernel` here.)
+
+That distinction settles the call. Every audio import whose name is known independently,
+from its own error string, lands in the library its name implies:
+
+| library | functions |
+|---|---|
+| `libSceAudioOut2` (17) | `GetSpeakerInfo`, `GetHrtfIdForCronos`, `GetTvCorrectionInfo` |
+| `libSceAudioOut` (7) | `sceAudioOutOpen` |
+
+`GrQ9s4IrNaQ` sits in library 7 beside `sceAudioOutOpen`, so it is the v1
+**`sceAudioOutGetPortState`** — not a `sceAudioOut2` function.
+
+**This was since confirmed against a libSceAudioOut symbol table** (a genstub NID map,
+from fw 3.2): `GrQ9s4IrNaQ` -> `sceAudioOutGetPortState`, `ekNvsT22rsY` ->
+`sceAudioOutOpen`, `DImz2Ft9E2g` -> `sceAudioOut2GetSpeakerInfo`. The library-placement
+argument above held.
+
+Its `SceAudioOutPortState` is 32 bytes, matching the caller's stack slot (`rbp-0x48` to
+`rbp-0x28`) derived separately, and the three offsets read land on named fields:
+
+```c
+typedef struct SceAudioOutPortState {
+    uint16_t output;          // +0x00  <- copied
+    uint8_t  channel;         // +0x02
+    uint8_t  reserved;        // +0x03
+    int16_t  volume;          // +0x04  <- copied
+    uint16_t rerouteCounter;  // +0x06
+    uint64_t flag;            // +0x08  <- copied (low half)
+    uint64_t reserved64[2];   // +0x10
+} SceAudioOutPortState;       // 32 bytes
+```
+
+### The client's full audio API surface
+
+Resolving every audio import the same way gives the complete picture of what the cloud
+client does with local audio. 19 of 21 resolve directly; the two that do not are
+PS5-only and were already named from the binary's own error strings.
+
+| stub | NID | function | observed use |
+|---|---|---|---|
+| `0x30d4d0` | `DImz2Ft9E2g` | `sceAudioOut2GetSpeakerInfo` | AUDIOSTATE FLAGS/ANGLE source |
+| `0x30d4f0` | `RsOQBASFo68` | `sceAudioOut2GetHrtfIdForCronos` * | AUDIOSTATE HRTF source |
+| `0x30d500` | `e9rTn1fwgbQ` | `sceAudioOut2GetTvCorrectionInfo` * | AUDIOSTATE TVCONFIG source |
+| `0x30d510` | `GrQ9s4IrNaQ` | `sceAudioOutGetPortState` | AUDIOSTATE PORTSTATES source |
+| `0x30d520` | `JfEPXVxhFqA` | `sceAudioOutInit` | decoder ctor |
+| `0x30d530` | `QOQtbeDqsT4` | `sceAudioOutOutput` | teardown, `(handle, NULL)` |
+| `0x30d540` | `s1--uE9mBFw` | `sceAudioOutClose` | teardown |
+| `0x30d590` | `ekNvsT22rsY` | `sceAudioOutOpen` | `openDevice`, port type 4 for padspk |
+| | `b+uAV89IlxE` | `sceAudioOutSetVolume` | |
+| `0x30d550`..`0x30d570` | | `sceAudioOut2{Port,User,Context}Destroy` | 3D-audio path teardown |
+| | | `sceAudioOut2Initialize`, `ContextCreate`, `UserCreate`, `PortCreate`, `PortSetAttributes`, `ContextAdvance`, `ContextPush`, `ContextQueryMemory`, `ContextResetParam` | `openDevice2`, the >8-channel path |
+
+\* named from the binary's own error strings; absent from the fw 3.2 map because they are
+PS5-only.
+
+Note the teardown idiom this confirms: `sceAudioOutOutput(handle, NULL)` to drain, then
+`sceAudioOutClose(handle)`.
+
+### Inside libSceAudioOut
+
+The module itself was later obtained, so the following is read off the implementation
+rather than inferred.
+
+**Legal port types.** `sceAudioOutOpen` validates the type against the bitmask
+`0x441f`, i.e. types **0, 1, 2, 3, 4, 10, 14** (plus `0x7d` and `0x7f` as special
+cases). Type 4, the pad speaker, is a first-class type, not a value smuggled through a
+general path.
+
+**`sceAudioOutGetPortState` (`0x2460`)** validates `(handle & 0x7f000000) == 0x20000000`
+with a port index of `handle & 0xffff` below `0x21` (33 ports), then fetches the state
+over IPC from the audio daemon and post-processes it:
+
+```c
+state->output  = daemon.word0;
+state->channel = daemon.byte2;
+if (capability_ok()) {
+    if (state->output & 1)                     // bit 0 implies bit 1
+        state->output |= 2;
+    if (port->type == 2 /* VOICE */ && (state->output & 4))
+        state->output = (state->output & ~7) | 3;
+}
+state->rerouteCounter = daemon.word6;
+state->flag = capability_ok() ? daemon.dword8 : 0;
+
+state->volume = 0xffff;                        // <-- note
+if (port->type == 4 /* PADSPK */)
+    state->volume = daemon.word4;
+```
+
+Two things matter here.
+
+**Volume identifies a pad speaker port.** Every port type reads back `0xffff` for volume
+*except* type 4, which is the only one whose real volume is reported. So within a
+PORTSTATES group, the pad speaker port is the one whose volume is not `0xffff`. Recorded
+as `CHIAKI_AUDIO_OUT_VOLUME_NOT_REPORTED`.
+
+`sceAudioOutSetVolume` shows the same asymmetry from the other side: for a type-4 port it
+converts the integer to float, scales and clamps it, and sends it to the daemon as its
+own parameter (id `0xa`); every other type goes down a different path.
+
+**`output` bit rules**, though not the constant names: bit 1 is set whenever bit 0 is,
+and a voice port with bit 2 set has its low three bits forced to 3. The values
+themselves originate in the audio daemon over IPC, so the module gives the rules but not
+the enum.
+
+The module's *other* consumers of the same fetch give more. `sceAudioOut2PortGetState`
+and its neighbours share the struct, and between them establish:
+
+- **`output == 0` means the port is not live.** Wherever the module decides a port has
+  nothing attached it writes `output = 0` and zeroes `channel` and `flag` to match. So a
+  pad speaker port that is actually feeding must carry a non-zero `output` — recorded as
+  `CHIAKI_AUDIO_OUT_OUTPUT_NONE`.
+- **bit 7 is real**, and gets masked back off unless the freshly fetched state has it.
+- **`channel` is a channel count, not an index.** Values 2, 8 and 12 all appear, with 12
+  downgraded to 8 when a capability is missing — so 7.1.4 falling back to 7.1.
+- **`flag` bit 0 is meaningful**, cleared for the stereo case.
+
+Together with the volume rule, that is most of what a synthesised PORTSTATES entry needs
+to look plausible: non-zero `output`, a sane `channel` count, a real `volume`, and `flag`
+low bit set or clear to taste. What is still unnamed is which destination each `output`
+bit denotes.
+
+Other things the module settles, for the record: `sceAudioOutSetPadSpkVolume` and
+`sceAudioOutSetPadJackVolume` exist as dedicated exports (IPMI method `0x4c`), so the pad
+speaker has its own volume path end to end; and the audio system's internal bus name
+table (in `libSceAudioSystem`, 50 entries of `{name, slot, 8}` at `0xa34340`) lists
+`PADSPK` and `VOICE(PADSPK)` as distinct buses alongside `TV`, `HP0..HP3`, `REC` and
+`REMOTE_PLAY` — the last being an explicit remote-play destination.
+
+Port table internals, if needed again: base `0x6cf98`, stride `0x1040`, port type at
+`+0x1020`, refcount at `+0x102c`, a disable bit at `+0x103a & 0x40`.
+
+---
+
+## 7. Retail remote play cannot do this
+
+Not a gate — a missing call.
+
+The host holds four AvCap consumer slots and releases all four in its destructor, but its
+factory pointer (`this->+0x17c0`) is touched **exactly seven times in the whole image**:
+
+| site | what |
+|---|---|
+| `0x225930` | the setter |
+| `0x21c67c` | create video -> vtable `+0x10` -> slot `+0x418` |
+| `0x21c9f5` | create main audio -> `+0x18` -> slot `+0x420` |
+| `0x21cb5f` | create haptics -> `+0x20` -> slot `+0x428` |
+| `0x21ac43`, `0x21ac67`, `0x21ac96` | three destroys -> `+0x28` (see the factory-interface subsection below) |
+
+Three creates. **Slot `+0x430` — the one the host's own padspk capture section reads at
+`0x22288a` — has no creator anywhere.** Everything else for the lane is present: format
+declaration, channel acceptance (both gates, below), four per-controller channel objects,
+capture thread section (`AvCap audioThread padspk`), the `mixToMain` fork, per-channel
+active flags, error logging. There are init-failure strings for `haptic`, `video` and
+`audio` and none for padspk, because there is no init to fail.
+
+Keep the two layers apart, because they answer different questions. *Channel acceptance*
+— does the host agree to the lane — is complete and gated only by the two conditions
+below. *Feeding* — does anything ever put audio into it — is the missing consumer. The
+lane is allocated and then starved, which is the behaviour this whole document started
+from.
+
+Supporting detail: the retail host has **no log strings for handling audio state at all**,
+only the protobuf descriptor entries that come free with the shared schema — consistent
+with AUDIOSTATE being acted on by the cloud server rather than this binary.
+
+None of this binds the cloud side — but for a sharper reason than "different build".
+This same binary carries the cloud server's code paths (`cc.prod.gaikai.com`,
+`Received config from cloud.`) behind a `/etc/gaikai-release` check that only a
+datacenter unit passes; see §10. So the padspk consumer is absent from the *retail mode*
+of a binary that has the reader for it either way. Cloud remains the only viable target,
+and the cloud-mode branch is where the missing construction would live.
+
+There is also a second, lesser blocker: feature 10 needs v15+, and remote play negotiates
+v12 (`streamconnection.c:276`).
+
+### The two gates, read out of the host
+
+The missing consumer is the *feed* layer. One layer up — whether the host accepts a
+declared `padspk` channel at all — is fully implemented, and both gates the lane passes
+through sit in one basic block inside the AvCap setup function `0x21b810`:
+
+```
+0x21becf  capability(6,  version)            ; feature 6, else main-only fallback
+0x21bf0a  cmp dword [rbp-0x110], 0xa         ; channel id 10 == COUNT -> reject
+0x21bf17  cmp byte [r13 + 0x214], 1          ; mixToMain?
+            yes -> name == "voice"  -> 0x21c611 : set [r13+0x1895]=1, reject
+                   name == "padspk" -> 0x21c57b : reject
+0x21bfdc  capability(10, version)            ; feature 10 = padspk
+            false and name == "padspk" -> 0x21c574 : reject
+            true                        -> 0x21c040 : accept
+```
+
+So the two conditions are exactly `mixToMain == false` **and** `capability(10, version)`,
+and nothing else stands between a declared padspk channel and acceptance. `capability` is
+the same predicate as the client's (`0x169910` host, `0x2511f0` client), so feature 10
+means protocol v15+ by the table in §2.
+
+A sweep of every `capability()` call site in the host — 64 of them — shows feature `0xa`
+queried exactly once, at `0x21bfdc`. There is no second padspk gate hiding elsewhere.
+
+### padspk and haptic are the same code path
+
+Past the gates, the accepted channel reaches `0x21c260`, and this is the part worth
+keeping:
+
+```
+0x21c252  cl = (name == "padspk")
+0x21c25b  cl = 1                     ; reached when name == "haptic"
+0x21c26d  [rbp-0x164] = cl           ; "this lane is per-controller"
+0x21c26a  r13d = 0
+          ... build one 0x40-byte channel object, register via 0x228210 ...
+0x21c2ec  cmp r13d, 3
+0x21c2f0  r13d++
+0x21c2f8  cl = (old r13d < 3)
+0x21c2fb  test [rbp-0x164], cl
+0x21c301  je exit
+```
+
+The loop runs **four times for haptic and for padspk, once for everything else**. The host
+builds one channel object per local controller for both lanes, from identical code. That
+is the four-controller model of §1 confirmed on the host side, and it means padspk is not
+a degraded or half-wired variant of haptic — at this layer it *is* haptic's code.
+
+The per-channel object also gets `[r12+0x38] = !(haptic || padspk)`, a flag set only for
+main, voice and video. Its use is not yet traced; `mixToMain`-adjacent is the obvious
+guess and is not more than a guess.
+
+### What `mixToMain` actually does
+
+`+0x214` is `mixToMain`, and both ends of it are now pinned. It is written by the
+`audioSettings` parser and read by the mixer:
+
+```
+0x28ec71  mov byte [r15 + 0x214], 0     ; default false
+0x28eca9  "mixToMain"
+0x28ecde  mov byte [r15 + 0x214], al    ; from JSON
+...
+0x222a1f  cmp byte [rbx + 0x214], 1
+0x222a50  fold the mono lane into the stereo main buffer, saturating
+```
+
+The mixer body is unambiguous: `movsx` a 16-bit sample from the mono source, `vfmadd213ss`
+it into the stereo destination, `vmaxss`/`vminss` to clamp, store back. That is a mono
+pad lane being folded into main. So `mixToMain = true` is not merely "prefer the main
+mix" — it makes the host reject the separate lane at `0x21bf17` *and* mix the audio into
+main instead, which is why both the user-facing behaviour and the gate agree.
+
+### The host's own channel-id allocator
+
+`0x1e69d0(name, padIndex)` is the host's equivalent of the client's `0x84ec0`, and it
+settles the channel model from the other side:
+
+```
+name == "main"   -> 0
+name == "voice"  -> 1
+name == "haptic" -> padIndex + 2
+name == "padspk" -> padIndex + 6
+otherwise        -> 10            ; the invalid/count sentinel
+```
+
+Read straight out of `0x1e6a77`-`0x1e6af8` (`add ebx, 2` for haptic, `add ebx, 6` for
+padspk, `mov eax, 0xa` as the fallthrough). This is §1's flat id space confirmed on the
+host, derived independently of the client, including that 10 is the sentinel — the same
+10 the acceptance path rejects at `0x21bf0a`.
+
+### The `+0x38` flag
+
+The per-channel object built at `0x21c34e` is `0x40` bytes and carries, at `+0x38`, the
+byte set at `0x21c420` from `[rbp-0x121]`, which is written exactly once, at `0x21c276`,
+as `!(haptic || padspk)`. Nothing else writes it. So `+0x38` is true for main, voice and
+video, and false for the two per-controller lanes.
+
+It is read in exactly one place. `0x2239c0` — call it `submitFrame(this, buf, len, ?, ?,
+channelId)` — locks the mutex at `this+0x17f8`, looks up `channelId` in the channel map at
+`this+0x17e8` (via the same `std::map` helper `0x228210`, node key `+0x20`, value `+0x28`),
+and then:
+
+```
+0x223a8f  mov rax, [rax + 0x28]        ; the channel object
+0x223a93  cmp byte [rax + 0x38], 1
+0x223a97  jne 0x223a41                 ; unlock and return, doing nothing
+```
+
+So `submitFrame` is a hard no-op for any haptic or padspk channel. Seven call sites reach
+it, all inside the audio thread `0x221b80`: two pass literal ids (`0` at `0x22353d`, `1`
+at `0x223567`) and four pass `0x1e69d0(name, padIndex)` — that is, ids that can be
+`2..5` or `6..9`.
+
+**All seven callers, identified.** Each computed-id site builds a `std::string` in a
+stack local from one of the host's name globals, then calls `0x1e69d0(name, padIndex)`:
+
+| call site | name string | pad index | channel ids |
+|---|---|---|---|
+| `0x22251e` | `"haptic"` (`0x53b308`, copied at `0x222420`) | `r13d`, `0..3` | 2-5 |
+| `0x222d59` | `"padspk"` (`0x53b2e8`, copied at `0x222ad8`) | `r13d`, `0..3` | 6-9 |
+| `0x222f5f` | `"padspk"` (copied at `0x222b77`) | `r13d`, `0..3` | 6-9 |
+| `0x2230a9` | `"padspk"` (copied at `0x222fcf`) | `r13d`, `0..3` | 6-9 |
+| `0x223144` | — | — | literal `0` |
+| `0x223540` | — | — | literal `0` |
+| `0x22356d` | — | — | literal `1` |
+
+The haptic site loops `inc r13d; cmp r13d, 4; je` — four pads, exactly as §7's channel
+loop builds four objects. The three padspk sites are variants rather than derivations of
+main: the last main/voice pair at `0x223540`/`0x22356d` submits the same buffer twice, the
+second time offset by `[rbp-0x1e8]` with `ecx = 0x800`, which looks like a second chunk or
+a redundancy copy, and the padspk sites have the same shape.
+
+**The tension this leaves.** Every per-controller submission — one haptic, three padspk —
+calls `0x2239c0`, and `0x2239c0` rejects exactly the lanes those sites feed, because
+`+0x38` is false for both. The literal-id sites (0, 0, 1) pass. Checked and re-checked:
+`[rbp-0x121]` is written once and read once with no overlapping store anywhere in
+`0x21b810`; `r14` holds `r13+0x17e8` from `0x21bcbc` with no reassignment, so setup and
+`submitFrame` use the same map; and `[node+0x28]` is the map's value slot, null-checked at
+`0x223a71` before the `+0x38` test.
+
+Two readings survived static analysis of that function alone: that `0x2239c0` is a
+secondary tap the per-controller lanes skip, or that `+0x38` means something narrower than
+assumed. Following a haptic frame from `readFrame` outward — next — rules out both of the
+obvious answers and leaves a third.
+
+### Following a haptic frame
+
+The haptic block in the audio thread, in full:
+
+```
+0x2222aa  rdi = this->+0x428                  ; the haptic AvCap consumer
+0x2222b4  if null -> error path
+0x2222cc  call [consumer_vtable + 0x20]       ; readFrame(&info@-0x198, 1, &err@-0x19c)
+          r14 = frame buffer
+0x222359  require info == 2 and err >= 0
+0x222379  r15 = byte length
+0x222393  r15 >>= 2                           ; /4 -> sample count (2ch x 16bit)
+0x222397  call 0x43eb30                       ; timestamp
+          descriptor @ -0x50 = { ts, sampleCount, tag = 4, flag = 0 }
+0x2223b2  call 0x22fd80                       ; (A)
+0x2223b7  r13d = 0
+  loop    id = 0x1e69d0("haptic", r13d)       ; 2..5
+0x22251e  call 0x2239c0                       ; (B)
+```
+
+Nothing else in the block touches the frame. So the frame leaves by (A), by (B), or
+inside `readFrame` itself. All three are now checked.
+
+**(A) is telemetry, and it is inert.** `0x22fd80` is a method on the class whose
+constructor at `0x22f8b0` names itself `StreamCollectorSender`, and it is a type-filtered
+queue push:
+
+```
+0x22fda0  require this->+0x138 & 1            ; enabled
+0x22fdb2  tag = desc->+0x0c
+0x22fdb6  require tag != 0
+0x22fdbf  linear search tag in [this->+0x120, this->+0x128)
+0x22fdee  not found -> return, frame dropped
+```
+
+The accepted-type list is hardcoded in the constructor and never appended to:
+
+```
+0x22fa8d  mov edi, 8          ; operator new(8) -- exactly four uint16_t
+0x22faa7  movabs rdx, 0x8000700060005
+0x22fabf  mov [rax], rdx      ; the list is { 5, 6, 7, 8 }
+```
+
+The audio thread pushes tag `4` (haptic, `0x22238d`) and tag `2` (`0x22358c`). Neither is
+in `{5, 6, 7, 8}`, so both are dropped at `0x22fde0`. When the queue *is* full it reports
+`currentSize` / `maxSize` as JSON — a metrics sink, not a transport. (A) carries nothing.
+
+**(B) rejects haptic**, as established above: `+0x38` is false for haptic and padspk, and
+`0x2239c0` returns at `0x223a97` without doing anything.
+
+The padspk block is the same code with two constants changed. At `0x22288a` it loads the
+consumer from `+0x430`, and:
+
+```
+0x222891  test rdi, rdi
+0x222894  je 0x22311a                      ; <-- where padspk dies on retail, every pass
+0x2228b0  call [consumer_vtable + 0x20]    ; readFrame, same slot as haptic
+0x2228bc  cmp dword [rbp-0x198], 3         ; frame type 3 (haptic checks 2)
+0x2228c9  require err >= 0
+```
+
+So the AvCap frame-type enum has 2 for haptic and 3 for pad speaker, the consumer
+interface is the same (`+0x20` is `readFrame` for both), and the single instruction that
+ends padspk on a retail host is the null test at `0x222891`.
+
+**So the frame leaves inside `readFrame`.** That is the only route left, and it fits
+everything else. `[consumer_vtable + 0x20]` is a virtual call on an object whose class is
+not in this binary (§ "Is there a voice consumer to repurpose?"), and the audio thread's
+job is then to *pump* the consumer rather than to carry its output: read a frame, timestamp
+it, offer it to a telemetry sink that ignores it, offer it to a submit path that ignores
+it, repeat. The transport lives on the far side of that vtable, in the module that supplies
+the factory.
+
+Stated as confidence rather than fact: this is the reading the evidence supports, and it
+is not proven, because the consumer's class cannot be read from any file in hand. What
+would prove it is `libSceRemoteplay.sprx` or whatever else implements the factory — the
+same file already at the top of the wanted list for a different reason.
+
+If it holds, it sharpens the conclusion rather than changing it. padspk is missing exactly
+one thing, and it is the thing that *is* the wire: the consumer at `+0x430`. Everything
+this document has traced downstream of it — the channel objects, the ids, the JSON, the
+two gates — is present and correct, and none of it can matter while the object that would
+produce and forward frames is never constructed.
+
+### Is there a voice consumer to repurpose?
+
+Worth asking, because padspk is voice field for field (§7). The answer at this layer is
+no, and the reason is informative.
+
+The AvCap factory pointer at `this+0x17c0` is touched seven times in the whole image and
+the vtable is used at exactly four slots: `+0x10` video, `+0x18` main audio, `+0x20`
+haptic, `+0x28` release. There is no voice creator to borrow — voice on the host is a
+capture path, not a playback consumer, so nothing at this layer can be aliased onto
+padspk. And the ids differ anyway: `0x1e69d0` makes voice a single global channel (1)
+while padspk is per-pad (6+n), so they cannot simply share.
+
+The factory's concrete class is not in this binary: no RTTI names survive, no relocation
+points a vtable slot at the setter `0x2258a0`, and its only reference is a jump thunk at
+`0x219c50` with no in-image caller. It is injected from outside. Grepping every module in
+hand — `libSceAvcap2.sprx`, `libSceAvcap2mvr.sprx` (both thin IPC stubs) and
+`SceSysCore.elf` — finds no `padspk` string at all, so the module that implements the
+factory, and would carry a fifth creator slot if one exists, is one we do not have.
+
+### The `audioSettings` schema
+
+The parser at `0x28e0xx`-`0x28f1xx` gives the exact shape the host accepts. `settings` is
+an **array**, not an object: `0x1780e0` returns its length, `0x178100(container, i)` gets
+element `i`, and the loop at `0x28efc0` walks it. Per element the parser first stamps a
+default template from `0x4f02a0` — sampleRate 48000, channels 2, samplesPerFrame 480,
+bitrate 64, i.e. the `main` lane's values — and each present key overrides one field.
+
+This block is known to work: it is what allocated all four lanes, padspk included.
+
+```json
+"audioSettings": {
+  "mixToMain": false,
+  "audioChannels": [
+    { "name": "main",   "fecMode": 2,
+      "settings": [{ "channels": 2, "sampleRate": 48000, "samplesPerFrame": 480,
+                     "bitrate": 64, "isRawPcm": false, "profileEnumType": 0 }] },
+    { "name": "voice",  "fecMode": 2,
+      "settings": [{ "channels": 1, "sampleRate": 48000, "samplesPerFrame": 480,
+                     "bitrate": 48, "isRawPcm": false, "profileEnumType": 0 }] },
+    { "name": "haptic", "fecMode": 2,
+      "settings": [{ "channels": 2, "sampleRate": 3000,  "samplesPerFrame": 30,
+                     "bitrate": 96, "isRawPcm": true,  "profileEnumType": 0 }] },
+    { "name": "padspk", "fecMode": 2,
+      "settings": [{ "channels": 1, "sampleRate": 48000, "samplesPerFrame": 480,
+                     "bitrate": 48, "isRawPcm": false, "profileEnumType": 0 }] }
+  ]
+}
+```
+
+Three things this settles:
+
+- **padspk is voice, field for field.** 1 channel, 48 kHz, 480 samples, 48 kbps, Opus.
+  Only the name differs. Anything that already builds a voice lane builds a padspk lane.
+- **It confirms `declareChannel` independently.** The bitrates here (96 haptic, 48 padspk)
+  and the rates and frame sizes are the same numbers §1 read out of `0x21d5a0`, arrived at
+  from the other direction.
+- **`fecMode: 2` is accepted for all four**, padspk included, so the lane needs no special
+  FEC handling.
+
+`name` takes the same four literals as the host's own table at `0x53b2a8` (main, voice,
+padspk, haptic — stride `0x20`, matching the cloud-constants table at `0x53a8a8` in §10
+entry for entry). `isRawPcm` and `fecMode` line up with the `AudioChannelPayload` fields
+already added to `takion.proto`.
+
+Worth being plain about what this block does and does not do. It gets the channels
+**allocated** — the host accepts the declaration and builds four per-controller objects
+(§7). It does not get them **fed**; that is the missing AvCap consumer, and no value in
+this JSON reaches it.
+
+---
+
+### The launchspec normalizer overwrites `audioSettings` (local host)
+
+Important correction to the section above, and it explains why hand-written `audioSettings`
+gets ignored on a local Remote Play host. `0x205040` is a **normalizer, not a parser**:
+
+```
+0x20505c  get   src."audioChannels"
+0x20507f  get   dst."audioSettings"
+0x20509b  "audioSettings" -> 0x1783e0      ; REMOVE the member
+0x2050a7  new object
+0x2050b0  re-add "audioSettings"
+0x2050c7  re-add "audioChannels"
+0x2050e0  source it from "audioChannelSettings"
+0x20512e  first entry "main"
+```
+
+So whatever `audioSettings` the launchspec carries is **discarded and rebuilt** from
+`audioChannelSettings`. On a local host the block in the previous subsection is therefore
+the shape the downstream parser accepts, not a thing a client can supply and have survive.
+The grant has to come from the launchspec the allocator seals, which on cloud is the
+allocator's to write and not the client's.
+
+(Independently found and confirmed here against `0x1783e0`, which is the JSON remove-member
+helper.)
+
+### The full grant chain
+
+```
+launchspec audioSettings.audioChannels[].name
+  -> channel-name list at session+0x1D8        (std::list, sentinel-based)
+  -> 0x21BC50   iterates it; empty list -> 0x21C625
+  -> 0x1E69D0   (name, pad_index) -> lane type
+  -> 0x21D5A0   per-channel default builder (sole caller: 0x21BC50)
+  -> capability(10, version)
+  -> STREAMINFO
+```
+
+`0x1E69D0` was decoded twice, independently, from opposite directions, with identical
+results: `main` 0, `voice` 1, `haptic` 2+index, `padspk` 6+index, anything else 10.
+
+### The factory interface has four slots, and none of them makes a padspk reader
+
+A full-image sweep of every instruction referencing displacement `+0x430`, `lea`
+address-of forms included, finds **50 distinct instructions and not one creator**. Most are
+other structures that happen to share the offset — `0x213CC3` writes a `0x30`-byte
+self-referencing sentinel whose `+0x418` is a byte flag, and `0x2E4A7B` / `0x2E4BED` write
+`0xF`, which is `std::string` SSO capacity.
+
+The destructor at `0x21AC40` settles what the factory vtable's slots are, and the answer
+corrects an earlier note in this document as well as one reasonable guess:
+
+```
+factory non-null:
+  0x21ac59  call [factory_vt + 0x28](factory, reader from +0x420)   ; audio
+  0x21ac78  call [factory_vt + 0x28](factory, reader from +0x418)   ; video
+  0x21aca0  call [factory_vt + 0x28](factory, reader from +0x428)   ; haptic
+            +0x430 is NOT released through the factory
+factory null (0x21acb0), the fallback:
+  0x21acbb  call [reader_vt + 8] on +0x420
+  0x21acd8  call [reader_vt + 8] on +0x418
+  0x21acf5  call [reader_vt + 8] on +0x428
+  0x21ad12  call [reader_vt + 8] on +0x430   <-- only here
+```
+
+So `factory_vt + 0x28` is **`destroyReader`**, and it is called — three times, for exactly
+the three readers the factory creates. It is not an uncalled padspk creator. The factory
+interface in use is four slots:
+
+```
++0x10 createVideo   +0x18 createAudio   +0x20 createHaptic   +0x28 destroyReader
+```
+
+The asymmetry in the destructor is the real tell, and it is sharper than "no creator
+exists". The factory path releases exactly what the factory made and deliberately skips
+`+0x430`; only the no-factory fallback touches it. Whoever wrote this knew `+0x430` would
+never hold a factory-created reader.
+
+That has a consequence worth stating plainly: a cloud host that does emit types 6-9 cannot
+be doing it through *this* factory interface. Either its factory carries a fifth slot, or
+the cloud build is not this binary. The corpus cannot distinguish those, since the factory
+vtable at `0x52E590` is zero-filled in the file and populated at runtime, and the setter
+`0x225930` has no static callers or pointer references at all.
+
+### Why a lane can be advertisable and unfillable in the same binary
+
+This deserves answering rather than restating, because the objection is a good one: if
+padspk were not supported, why can the host advertise it at all? Something must be there.
+
+Something *is* there — the whole vocabulary. What is not there is the capture, and the
+split falls on a layer boundary rather than being an oversight.
+
+**The protocol layer is shared and complete.** `0x1E69D0`, the channel-name list at
+`session+0x1D8`, `0x21BC50`, `0x21D5A0`, the capability table at `0x4F65F0`, the lane-name
+arrays at `0x53A8A8` and `0x53B2A8` — all of it knows padspk as a first-class lane kind,
+in the same order and value space as main, voice and haptic. That is one Takion stack
+serving remote play, PSNow and cloud, which is also why backwards compatibility with
+PS4-era requests holds: it lives in this layer. The strongest single piece of evidence for
+the sharing is that `gaikai-player.sprx` is **byte-identical** under NPXS40074 and
+NPXS40099 (md5 `92f5af67…`). One client binary, both transports.
+
+**The capture layer is per-build and bound to the host's audio stack.** It is the AvCap
+reader, and the evidence that it is a separate concern is positive, not merely absent:
+
+- **The destructor is asymmetric on purpose.** At `0x21AC40`, when the factory is present
+  it destroys exactly `+0x420`, `+0x418` and `+0x428` through `factory_vt+0x28` and
+  **skips `+0x430`**. Only the factory-null fallback at `0x21ACB0` touches `+0x430`, at
+  `0x21AD12`. Code that merely forgot to create a reader would not also know to leave that
+  slot out of the factory teardown.
+- **Readers come from outside the binary.** The factory vtable at `0x52E590` is zero-filled
+  in the file and populated at runtime, and its setter `0x225930` has no static callers or
+  pointer references anywhere. This image does not know what supplies its readers.
+- **The sweep is complete, and clean.** Twelve stores to `+0x430` exist in the whole image;
+  all twelve are now classified and none installs a reader — three `add` on a stats struct
+  at `0x6DC3D`/`0x6DCC4`/`0x6EB67`, a timestamp at `0x29ECF7`, `std::string` SSO capacity
+  at `0x2E4A7B`/`0x2E4BED`, a `0x30`-byte sentinel at `0x213CC3`, an unrelated class at
+  `0x2EDC87`, a stack slot at `0x25A7FB`, and three zeroing cleanups. There is also no
+  setter-shaped store (`mov [rdi+0x430], rsi`) for it, though such stores exist for other
+  classes' `+0x420` and `+0x428` at `0x2EDCA7` and `0x2EDE16`, and for the factory itself
+  at `0x225930`.
+
+So the honest reading is not "padspk is unsupported". It is that **the host that emits
+types 6-9 is not this image** — same lineage, same protocol layer, a capture layer this
+build does not carry. Advertising is protocol; filling is platform. A binary can do the
+first without the second, and this one does.
+
+**What would overturn this**, cheaply: another firmware's `NPXS40102/eboot.bin`. The corpus
+holds exactly one version of the local host — the copy under `PS5-2/system/vsh/app/` and
+the one in the `fw3` tree are byte-identical, SHA-256 `e83f6352…9d35ae5`. A single
+different build with an install at `+0x430` would replace this section outright. Until
+then, one image is one data point.
+
+### Capability ids actually used
+
+Two independent sweeps agree: `1-7, 9-11, 13-15, 17-18`. **There is no capability-8 check
+anywhere in the image.** Feature 10 (padspk) is queried exactly once, at `0x21BFDC`, in the
+grant path — never in the reader path.
+
+### CTRL channel: nothing reaches reader creation
+
+Jump table at `0x4F30C8`, signed rel32 relative to the table base, dispatched at `0x36CD3`
+(`movsxd rax,[r13+rax*4]; add rax,r13; jmp rax`) indexed by `type - 8`; types above `0x1FD`
+compared separately at `0x36D3D`.
+
+| CTRL type | handler | what it is |
+|---|---|---|
+| `0x11` | `0x36F69` -> parser `0x3E370` -> `0x32A00` | platform identification, **not** a capability mask: writes `[obj+0x2F58]`, selects Unknown / PS4 / Android / PS5 / DWC / Windows / Mac / iOS from `[obj+0x2FD8]` |
+| `0x13` | `0x37066` | DualSense feature index/value; chiaki's `0x40` maps to invalid `0xFF` |
+| `0x910` | separate compare | display devices |
+
+None touch `+0x430`, `+0x17C0` or `+0x6DC`. Capability flags at `session+0x6DC` have a
+single store, at `0x21B72D` inside `0x21B720`, which is vtable-dispatched with no static
+references.
+
+### What the client can actually send
+
+The client's own request builder is at `0x27810` in `gaikai-player.sprx`, and it writes the
+schema out key by key between `0x28136` and `0x28537`:
+
+```json
+{
+  "audioChannels": [
+    {
+      "name": "default",
+      "encoderType": "opus",
+      "audioChannelSettings": {
+        "audioChannelType":  <int>,
+        "isSigned":          <bool>,
+        "sampleRate":        <int>,
+        "sampleSize":        <int>,
+        "channels":          <int>,
+        "maxFrameDataSize":  <int>,
+        "samplesPerFrame":   <int>,
+        "bitrate":           <int>,
+        "isRawPcm":          <bool>,
+        "fecMode":           <int>
+      }
+    }
+  ],
+  "pauseModeRequested":  ...,
+  "numberOfSlices":      ...,
+  "disableRPEncryption": ...,
+  "handshakeKey":        ...
+}
+```
+
+Two things make this the interesting object rather than another config blob.
+
+**It is the host's channel struct, field for field.** Compare the 36-byte entry read out of
+`declareChannel` in §1:
+
+```
++0x00 audioChannelType     +0x14 channels
++0x04 (5)                  +0x18 maxFrameDataSize
++0x08 isSigned             +0x1c samplesPerFrame
++0x09 isRawPcm             +0x20 bitrate
++0x0c sampleRate
++0x10 sampleSize
+```
+
+Every field, same names, same order. `audioChannelSettings` is the wire form of that
+struct.
+
+**`audioChannelType` is the lane id itself.** Not a name to be mapped — the number. The
+host reads it at `0x205290`, inside the same normalizer `0x205040` that rebuilds
+`audioSettings`, and again at `0x1e5a0d`. So `0x1E69D0`'s name mapping
+(`padspk` -> `6+index`) and this numeric field are two ways into the same value space, and
+the client's request carries the numeric one.
+
+That closes the chain end to end:
+
+```
+client request  audioChannels[].audioChannelSettings.audioChannelType
+  -> allocator seals a launchspec                      <- the unknown link
+     -> host 0x205040 : drop audioSettings, rebuild from audioChannelSettings
+        (reads audioChannelType at 0x205290)
+        -> channel-name list at session+0x1D8
+        -> 0x21BC50 -> 0x1E69D0 -> 0x21D5A0
+        -> capability(10, version)
+        -> STREAMINFO lanes 6-9
+```
+
+So what to send is answerable precisely: four more `audioChannels` entries carrying
+`audioChannelType` 6, 7, 8, 9 with the padspk format from §1 — `channels` 1,
+`sampleRate` 48000, `samplesPerFrame` 480, `sampleSize` 2, `bitrate` 48, `isRawPcm` false,
+`encoderType` `"opus"`, `fecMode` 2.
+
+**What is not answerable from any binary here** is whether the allocator forwards
+client-supplied `audioChannelSettings` into the launchspec it seals, or overwrites it the
+way the local host's normalizer overwrites `audioSettings`. That decision runs at
+`cc.prod.gaikai.com` (§11) and exists in no file in the corpus. It is the one remaining
+link, and it is the allocator-side lever — testing it means sending the block and reading
+the STREAMINFO that comes back, not reading more firmware.
+
+### Where that leaves the two transports
+
+| transport | grant (6-9 in STREAMINFO) | emission | status |
+|---|---|---|---|
+| local Remote Play | works — client authors the launchspec | never — no padspk reader is ever created | closed on stock firmware |
+| PS Plus cloud | not granted to a third-party client; first-party sessions do get it | first-party captures carry real audio | open, allocator-side |
+
+Local Remote Play is closed at the instruction level. Cloud is the only transport where the
+feature exists end to end, and the remaining lever is whatever makes the allocator write a
+padspk channel block into the sealed launchspec.
+
+---
+
+## 8. The console side: why an allocated lane stays silent
+
+Everything above is the streaming stack. This section is the audio stack underneath it,
+read out of `/system/priv/lib/libSceAudioSystem.sprx` — the real audio daemon (§"Where the
+daemon actually is"). It answers the question the rest of the document kept deferring:
+the channels are allocated and nothing plays through them.
+
+### The console already has pad-speaker capture
+
+The daemon carries, as plain strings:
+
+```
+AudioAvCapMgrShmPadSpk          /evf_acap.padspk
+AudioAvCapMgrShmHapticFull      AudioAvCapMgrShmHapticShare
+AudioAvCapMgrShmFull            AudioAvCapMgrShmShare       AudioAvCapMgrShmPart
+sceAudioOut2AvCapBufferInit
+sceAudioOutConnectRemote  /  DisconnectRemote  /  ConnectShare  /  ConnectCustom
+sceAudioOutServerBusConnect  /  BusDisconnect  /  BusSetIoParam
+```
+
+So the capture side of pad speaker exists on the console, by name, with its own shared
+memory region and its own event flag, sitting beside the haptic ones. This is not a
+feature that has to be invented — it has to be connected.
+
+### The enums, recovered
+
+The daemon names things for its JSON/diagnostic output through pointer tables that the
+relocation data makes readable. Three tables matter.
+
+**Output destinations** (`0xb4320`, 7 entries, indexed directly at `0x1a290`):
+
+```
+0 TV        1 HP0       2 HP1       3 HP2
+4 HP3       5 REC       6 REMOTE_PLAY
+```
+
+**This is the `output` field of `SceAudioOutPortState`** (§6), and it closes the open
+question there. libSceAudioOut masks that field with `0x7f` at `0x18320` — exactly seven
+bits, exactly these seven names — so `output` is a bitmask over this list:
+
+```
+bit 0  0x01  TV            bit 4  0x10  HP3
+bit 1  0x02  HP0           bit 5  0x20  REC
+bit 2  0x04  HP1           bit 6  0x40  REMOTE_PLAY
+bit 3  0x08  HP2           bit 7  0x80  cleared when port->+0x754 is set; unnamed
+```
+
+The rules read earlier out of libSceAudioOut now make sense rather than being arbitrary:
+`output == 0` means no destination, so not live; bit 0 implying bit 1 is TV implying HP0;
+and the voice case forcing the low three bits to 3 is forcing `TV|HP0`.
+
+**Device / port types** (`0xb4370`, reached for kinds 1-4 via the jump table at `0xa4bfc`):
+
+```
+HEADPHONE   PADSPK   VIBRATION   VOICE(PADSPK)   VIBRATION_VR
+```
+
+`VOICE(PADSPK)` as a single label is the daemon agreeing with libSceAudioOut, which
+handles port types 2 (voice) and 4 (pad speaker) in one branch at zero volume (§6), and
+with the `audioSettings` block where padspk is voice field for field (§7).
+
+**Bus types** (`0xb43a0`, kind 5; kind 6 enters the same list two entries in at `0xb43b0`):
+
+```
+0 REC    1 GLS    2 REMOTE    3 SHARE
+4 VIBRATION0  5 VIBRATION1  6 VIBRATION2  7 VIBRATION3
+8 EXTRA_VOICE
+9 EXTRA_PAD0  10 EXTRA_PAD1  11 EXTRA_PAD2  12 EXTRA_PAD3
+```
+
+**`EXTRA_PAD0` through `EXTRA_PAD3`.** Four buses, one per controller, beside four
+vibration buses and an extra voice bus. That is the console-side counterpart of channels
+6-9, named and enumerated, in the daemon, today.
+
+### What this says about the silence
+
+The chain a pad-speaker sample has to travel is now visible end to end, and the streaming
+half of it is not where it breaks:
+
+```
+game writes audio-out port, type 4 (PADSPK)
+  -> daemon routes it by the port's output bitmask
+       bit 6 REMOTE_PLAY set?  -> into the capture path
+       otherwise               -> out to the physical controller over MBUS
+  -> EXTRA_PADn bus  ->  AudioAvCapMgrShmPadSpk  ->  /evf_acap.padspk
+  -> AvCap padspk consumer (host +0x430)  ->  readFrame  ->  wire
+  -> channel 6+n, declared and accepted   <- this is where the work so far ends
+```
+
+Declaring channels 6-9 and passing both gates gets the right-hand end of that chain built.
+It does not set `output` bit 6 on anything, does not connect an `EXTRA_PADn` bus, and does
+not cause `sceAudioOutConnectRemote` to be called for a pad-speaker port. Nothing in the
+negotiated channel set reaches back into the daemon. That is consistent with lanes that
+allocate cleanly and carry nothing: the far end of the pipe is built, and the near end is
+still pointed at the controller.
+
+Which makes `AUDIOSTATE` `PORTSTATES` the interesting message again, and for a concrete
+reason rather than a structural one. It is the client telling the host the state of its
+audio output ports, `output` bitmask included — and `output` bit 6 is `REMOTE_PLAY`.
+
+### Still missing, precisely
+
+Naming the bits does not by itself say who sets them. The write side is
+`sceAudioOut2IpmiMbusSetPortConnections` / `SetPortStatuses`, which libSceAudioOut
+implements as thin IPMI wrappers — and `libSceMbus` is in libSceAudioOut's needed-library
+list, confirmed in its dynamic strings alongside `libSceIpmi`. `libSceMbus.sprx` decides
+whether a type-4 port's audio goes to the controller, to a capture bus, or to both. It
+remains the top of the file list, now for a sharper reason than before.
+
+One thing ruled out along the way: the `spark.*` keys in libSceAudioOut
+(`spark.vid`, `spark.pid`, `spark.interface`, `spark.config`, `spark.altsetting`,
+`spark.endpoint`, `spark.padTo` = `0x800`, `spark.reset`, `spark.cap` = `0x40`,
+`spark.enable`, `spark.outputFile`, plus a `sparkuplus.*` set) are a libusb transport for a
+wired pad speaker, not a routing switch. `spark.padTo` pads USB transfers to 2048 bytes; it
+has nothing to do with where pad audio is sent.
+
+---
+
+## 9. What this branch implements
+
+| commit | content |
+|---|---|
+| `a8d1f70` | channel-id model, per-lane routing, padspk receivers, advertisement, Android path |
+| `498890b` | codec correction (padspk is Opus), AV header size tables |
+| `9364738` | feature table, `AudioStatePayload` in the proto, AUDIOSTATE sender |
+| `ab5829b` | all five AUDIOSTATE blob builders |
+| `0ff240a` | channel -> port type mapping |
+| `cf42a2f` | port state struct shape |
+| `e09a393` | port state field names |
+
+Concretely:
+
+- **`takion.c`** — the channel byte is kept as `ChiakiTakionAVPacket.audio_channel`;
+  `is_haptics` now means "in 2..5"; muting stream audio no longer kills padspk (haptics
+  was already exempt); `chiaki_takion_protocol_feature_supported()`.
+- **`audioreceiver.c`** — dispatches on channel id to a per-pad padspk sink.
+- **`pscloud_audio_reassembler.c`** — tracks channel per unit instead of a haptics bool;
+  FEC-recovered units inherit the generation's channel instead of silently defaulting to
+  main (that was a latent bug).
+- **`streamconnection.c`** — one receiver per padspk lane; the advertisement in the mic's
+  audio-settings message, gated on cloud + feature 10 + `!mixToMain`;
+  `chiaki_stream_connection_send_audio_state()` with the verified gates and mask clamp.
+- **`audio.c` / `audio.h`** — the channel model, lane formats, port-type mapping, and the
+  five blob builders.
+- **Android** — `PadSpeakerAudioRouter` feeds the existing DualSense BT speaker FIFO;
+  per-pad mono Opus decoders live in the JNI so Kotlin only ever sees PCM; follows the
+  host's player index; off by default behind `controller_pad_speaker_lane`.
+
+Verification status: all of `lib/` compiles clean (the only failures are pre-existing
+missing third-party headers — jerasure, opus, ffmpeg — plus one pre-existing `const`
+warning in `send_big`). Blob layouts and the port-type mapping were checked byte-for-byte
+with throwaway harnesses. **The JNI was only reviewed by hand** — there is no Android SDK
+in the environment this was written in, so the Opus decode path is uncompiled.
+
+---
+
+## 10. What is left
+
+Two things, in order.
+
+**1. The port-state values.** The layout is exact; the semantics of what to put in
+`output` and `flag` for a pad-speaker port are not established. These are
+`SCE_AUDIO_OUT_STATE_OUTPUT_*` and `SCE_AUDIO_OUT_STATE_FLAG_*` constants. `output` is the
+interesting one — it says where the port's audio is going, so for a type-4 port it is
+presumably what marks it as pad-speaker bound.
+
+Two ways to close it:
+
+The module has since been read (see "Inside libSceAudioOut" above), which settled part of
+this and bounded the rest:
+
+- **Settled:** the legal port types, and that `volume` reads `0xffff` for every port type
+  except the pad speaker — which is itself a usable signal.
+- **Answered since (§8):** the `output` bit names, recovered from libSceAudioSystem's own
+  diagnostic tables — `TV, HP0, HP1, HP2, HP3, REC, REMOTE_PLAY` for bits 0-6, which is
+  why libSceAudioOut masks the field with `0x7f`. **Bit 6, `0x40`, is `REMOTE_PLAY`.**
+- **Still open:** the `flag` constant values, and — more importantly — who *sets* `output`
+  bit 6 for a pad-speaker port. That write side is `sceAudioOut2IpmiMbusSetPortConnections`
+  / `SetPortStatuses`, thin IPMI wrappers over `libSceMbus`, which is still the top file
+  on the list.
+
+### Where the daemon actually is
+
+Worth being precise, because it is easy to get wrong: `orbis_audiod.elf`
+(`/system/sys/`) is **not** the daemon. It is a 1884-byte bootstrap whose whole job is
+to load MBUS, HMD2, AJM and IPMI and then
+`/system/priv/lib/libSceAudioSystem.sprx` — which is the real implementation, and which
+*is* in the dump at 816 KB.
+
+The port state does not travel by IPC either. libSceAudioOut reads it out of **shared
+memory** under a spinlock (`lock cmpxchg` on `port+0x48`), so both sides of the struct
+are in reach in principle.
+
+The composer chain on the read side is `sceAudioOutGetPortState` -> `0x186c0` (a two
+instruction thunk) -> `0x18320` -> `0x211b0`. `0x18320` holds the interesting part:
+
+```c
+if (port->+0x754) state.output &= 0x7f;          // bit 7 cleared conditionally
+if (port->volume /*float at +0x554*/ == 0.0f) {
+    switch (port->type /*+0x00*/) {
+      case 2:  /* VOICE  */
+      case 4:  /* PADSPK */ ... same branch ...
+      case 3:  /* PERSONAL, and only when output bit 2 is clear */ ...
+    }
+}
+```
+
+So voice and pad speaker are handled as a pair at zero volume, distinct from personal,
+which additionally tests output bit 2 — more evidence that the low output bits encode a
+destination and that type 4 is a real routing case.
+
+Partial shm port object map, from the read side: type at `+0x00`, volume (float) at
+`+0x554`, a dword at `+0x550`, `+0x4a8`, floats at `+0x470`/`+0x474`, a dword at
+`+0x478`, flags at `+0x730`/`+0x734`/`+0x754`. libSceAudioOut also has a generic
+parameter getter at `0x186d0` with a 33-entry jump table mapping parameter ids onto
+those fields — an enumerable API surface if it is ever needed.
+
+The daemon side additionally exposes `sceAudioOutConnectRemote` /
+`sceAudioOutDisconnectRemote`, `sceAudioOutConnectShare` and
+`sceAudioOutServerBusConnect` / `BusDisconnect` — explicit attach points for remote play
+audio, which is where a cloud host would hook a bus up.
+
+What is still not pinned is the naming of each output bit. Matching the writer side in
+libSceAudioSystem by raw field offset does not work, because the daemon indexes the same
+shm with a different base and stride; finding it means following its own port table
+rather than grepping offsets. That is the next thread to pull if the values are wanted
+exactly rather than by experiment.
+
+A genstub `.c` is no use for any of this: those carry NID -> name mappings only, no
+`#define`, `enum` or `struct`.
+- **Brute-force.** `output` is 16 bits with few meaningful values, `volume` is obvious,
+  `flag`'s low half is likely small. The host gives a clean per-attempt yes/no, and no
+  capture decryption is needed. Practical now that the search space is three named fields
+  rather than three opaque words.
+
+**2. Takion v15-20.** Even with correct PORTSTATES, a session must negotiate v15+ for any
+of it to be accepted. That needs:
+
+- the AV parser extended — v15-19 is one extra byte in the audio-specific header region,
+  v20 is 8 extra in the common prefix (§3); the byte's meaning is still unknown
+- P-521 ECDH alongside the existing curves (§3)
+- the negotiated version raised past 12 (`streamconnection.c:276`, `senkusha.c:175`)
+
+Until then the padspk code is correct but dormant: it refuses cleanly and logs why rather
+than failing silently.
+
+---
+
+## 11. The cloud server is this same binary
+
+Worth establishing before the file list, because it changes what is worth asking for.
+
+`NPXS40102/eboot.bin` is not "the remote play host, and cloud is something else". Its
+static-constants initialiser at `0x1e0910` sets up, in one block:
+
+```
+0x53a8a8  "main"                          0x53a8c8  "voice"
+0x53a8e8  "padspk"                         0x53a908  "haptic"
+          "InvalidSessionId"
+          "https://cc.prod.gaikai.com"     ".prod.gaikai.com"
+          "tak-d.TakionDaemon"             "/etc/gaikai-release"
+```
+
+Four points fall out of that:
+
+- The four lane names are a contiguous array, stride `0x20`, in the order
+  **main, voice, padspk, haptic**. That is a lane-*kind* enum (0..3), not the flat
+  channel id space of §1, and the host names padspk as a first-class kind rather than as
+  an afterthought hung off haptic.
+- The string layout is `{ chars[16] @ +0x00, size @ +0x10, capacity @ +0x18 }`, confirmed
+  against the destructor at `0x30150` (`cmp [rdi+0x18], 0x10` picks heap vs inline). Worth
+  recording because it is not libstdc++'s layout and offsets read wrong if assumed.
+- `cc.prod.gaikai.com` is the Gaikai cloud control plane, and the binary also carries
+  `Got sessionId from cloud: %s` and `Received config from cloud.` — so the *server*
+  half of a cloud session is in here, not only the remote play half.
+- `/etc/gaikai-release` is read at `0x1d8f10` as an ifstream, one `getline` into a member
+  at `+0xb98`. That file exists on a Gaikai datacenter unit and not on a retail console,
+  which is a plausible mechanism for exactly the split this whole document is about: one
+  binary, two modes, and the retail mode skipping work the cloud mode does.
+
+The padspk *reader* is present on both: `0x221b80` is a single audio thread function
+carrying a per-kind error string for each lane, and the padspk one
+(`"AvCap audioThread padspk last error: [ReadFrameResult:"`, referenced at `0x2232c1` and
+`0x223349`) sits beside the haptic one (`0x222671`, `0x2226f9`). A full scan for the
+consumer slots confirms the earlier finding rather than softening it:
+
+```
++0x418 video    created at 0x21c6ad / 0x21c8ac
++0x420 main     created at 0x21ca5d
++0x428 haptic   created at 0x21cb78
++0x430 padspk   released at 0x21ad03/0x21ad15, read at 0x22288a — never written
+```
+
+So the slot is declared, destructed and read, and nothing in this build constructs it.
+That is what "purposefully left unsoldered" looks like in a binary, and it is why the
+cloud-mode branch is the thing to chase.
+
+One more small confirmation of the premise: `gaikai-player.sprx` is byte-identical
+(md5 `92f5af67…`) under NPXS40074 and NPXS40099. Cloud and remote play are not merely the
+same protocol — on the client they are the same file.
+
+---
+
+## 12. Firmware files still needed
+
+Checked against the FTP listing of a live console (`ps5_filelist.txt`, 11 499 paths).
+Every path below was verified to exist in that listing, so each is pullable as written.
+
+**Already in hand**, so nothing gets re-pulled: `gaikai-player.sprx`,
+`/system/vsh/app/NPXS40102/eboot.bin`, `libScePSNowGkp.sprx`,
+`Sce.Vsh.CloudClient.dll.sprx`, both `ReactNative.*.Vsh.PSNowPlayer.dll.sprx`,
+`psnow-config.env`, `psnow-subsids.env`, NPXS40074's `app.exe.sprx`, `rp.json` and
+`Sce.Vsh.RemotePlay.dll.sprx`, `libSceAudioOut.sprx` (supplied separately),
+`libSceAudioSystem.sprx`, `orbis_audiod.elf`, `libSceAudio3d.sprx`, `libSceIpmi.sprx`,
+`libSceAvcap2.sprx`, `libSceAvcap2mvr.sprx`, `SceSysCore.elf`,
+`libSceVideoStreamingEngine{,_sys,AudioOnly}.sprx`, `libSceOpusCeltDec/Enc.sprx`,
+`libSceBluetoothHid.sprx`, `libSceHidControl.sprx`, `libSceUserService.sprx`.
+
+**Takion v15-20 needs no further firmware** (§9, item 2). Header sizes, the feature table
+and the curve list all came out of binaries already in hand; that part is code to write.
+
+### Top 20
+
+1. `/system/common/lib/libSceMbus.sprx`
+   The single highest-value file. `orbis_audiod.elf` loads MBUS before anything else, and
+   libSceAudioOut's `sceAudioOut2IpmiMbusSetPortConnections` / `SetPortStatuses` are thin
+   IPMI wrappers straight into it. MBUS is the *writer* of the port-state words; every
+   binary read so far has been a reader. This is what closes the `output` / `flag`
+   constants of §9.
+
+2. `/system_ex/app/NPXS40099/eboot.bin`
+   The cloud player's own app process — the thing that loads `gaikai-player.sprx` and
+   builds the audio settings the host reads. The player library is in hand; the process
+   that configures it is not.
+
+3. `/system_ex/app/NPXS40074/eboot.bin`
+   The remote play app process. Same lineage, and since the player library is byte
+   identical between the two apps, diffing these two eboots isolates whatever is
+   cloud-only in the client's session setup.
+
+4. `/system/common/lib/libScePad.sprx`
+   The local half of "channel `6+pad` belongs to controller N": how an audio-out port of
+   type 4 is bound to a specific pad handle. Currently inferred from the client only.
+
+5. `/system/common/lib/libSceAudioIn.sprx`
+   A mirror reader over the same shared-memory port object with a different legal
+   port-type set. Diffing it against libSceAudioOut separates destination bits from
+   device-state bits without guessing.
+
+6. `/system_ex/app/NPXS40087/psm/Application/resource/Sce.Vsh.ShellUI.Settings.Peripherals.AudioDeviceSettings.rco`
+   The settings UI that lists audio output destinations to the user. Its resource table is
+   the cheapest plausible source of human-readable names for the very `output` values
+   item 1 is chasing.
+
+7. `/system/common/lib/libSceRemoteplay.sprx`
+   The game-facing streaming API — what a *title* uses to learn it is being streamed. If a
+   title has to opt a pad-speaker port into the stream, that opt-in is declared here, and
+   it would explain the never-constructed consumer at `+0x430`.
+
+8. `/system_ex/app/NPXS40087/eboot.bin`
+   The ShellUI system process. It is not itself the cloud app, but it is the process that
+   hosts `libScePSNowGkp.sprx` and owns the audio device settings, so it sits on both
+   sides of this problem.
+
+9. `/system/common/lib/libSceAjm.sprx`
+   AJM is the codec/job engine `orbis_audiod` loads alongside MBUS. Settles whether the
+   console expects a type-4 port to carry PCM or an encoded payload — the console-side
+   counterpart of the `isRawPcm = 0` finding in `declareChannel`.
+
+10. `/system/common/lib/libSceCloudMessaging.sprx`
+    Nothing in hand references `/dev/cloudsd` or `/dev/cloudsd2`, both of which are in the
+    listing. This is the only plausible owner of those nodes, and therefore the only
+    candidate for a console-side cloud control channel.
+
+11. `/system/common/lib/libSceAjmi.sprx`
+    The instance/IPC half of AJM; the port-to-job binding is likelier here than in
+    libSceAjm proper.
+
+12. `/system/priv/lib/libSceAudiodecCpuOpus.sprx`
+    If padspk is Opus console-side too, this is the decoder the daemon reaches for, and
+    its frame parameters pin the lane format from the host rather than from
+    `declareChannel`.
+
+13. `/system_ex/app/NPXS40099/psm/Application/app.exe.sprx`
+    The cloud app's managed front end. NPXS40074's equivalent is in hand; this one is not,
+    and managed binaries keep readable enum and field names where the native side has ids.
+
+14. `/system_ex/app/NPXS40099/json-configs/rp.json`
+    NPXS40074's copy is in hand and is a *client* profile (`"clientName":"PCClient"`,
+    `"audioChannels":"2.1"`). If NPXS40099's differs, the delta is the cloud profile.
+
+15. `/system_ex/app/NPXS40074/sce_sys/param.json`
+16. `/system_ex/app/NPXS40099/sce_sys/param.json`
+    Tiny. They name the two apps outright, which removes the last guesswork about which
+    title id is cloud and which is remote play.
+
+17. `/system_ex/app/NPXS40087/psm/Application/app.exe.sprx`
+    ShellUI's managed front end, same reasoning as 13, for the audio-device side.
+
+18. `/system/common/lib/libSceCustomMusicAudioOut.sprx`
+    A second, independent caller of `sceAudioOutOpen` using unusual port types — an
+    outside check on the `0x441f` port-type mask in §6.
+
+19. `/system/common/lib/libScePadTracker.sprx`
+    Pad enumeration order. Confirms the index behind channel `6+pad` is the same index
+    libScePad reports rather than a separate audio-side numbering.
+
+20. `/system/common/lib/libSceAudiodec.sprx`
+    Generic decoder dispatch; relevant if AJM turns out to route padspk through the
+    generic path instead of the Opus one.
+
+### The rest
+
+- `/system_ex/app/NPXS40087/gls/gls_config.json` and
+  `/system_ex/app/NPXS40087/gls/gls_provider_profile.json`
+  Game live streaming profiles. A third streaming audio path, useful only as a contrast
+  case for how lanes are declared.
+
+- `/system_ex/app/NPXS40099/psm/Application/Sce.Vsh.RemotePlay.dll.sprx`
+  Probably identical to NPXS40074's, which is in hand. Worth a hash comparison only.
+
+- `/system/common/lib/libSceAudiodecCpu.sprx`
+  The CPU half of the generic decoder dispatch, only if 20 turns out to matter.
+
+- `/system/common/lib/libSceAudioPropagation.sprx`
+  3D audio placement. Only needed to confirm padspk is excluded from the 3D mix, which
+  bears on the `mixToMain` gate in §7.
+
+- `/system/vsh/app/NPXS40102/eboot.bin`
+  Already in hand, but from a different archive than this listing. A re-pull matched to
+  the listing's firmware would confirm every address in this document against one known
+  version.
+
+### Copy-paste list
+
+All 20 verified present in `ps5_filelist.txt` and absent from what is already extracted.
+
+```
+/system/common/lib/libSceMbus.sprx
+/system_ex/app/NPXS40099/eboot.bin
+/system_ex/app/NPXS40074/eboot.bin
+/system/common/lib/libScePad.sprx
+/system/common/lib/libSceAudioIn.sprx
+/system_ex/app/NPXS40087/psm/Application/resource/Sce.Vsh.ShellUI.Settings.Peripherals.AudioDeviceSettings.rco
+/system/common/lib/libSceRemoteplay.sprx
+/system_ex/app/NPXS40087/eboot.bin
+/system/common/lib/libSceAjm.sprx
+/system/common/lib/libSceCloudMessaging.sprx
+/system/common/lib/libSceAjmi.sprx
+/system/priv/lib/libSceAudiodecCpuOpus.sprx
+/system_ex/app/NPXS40099/psm/Application/app.exe.sprx
+/system_ex/app/NPXS40099/json-configs/rp.json
+/system_ex/app/NPXS40074/sce_sys/param.json
+/system_ex/app/NPXS40099/sce_sys/param.json
+/system_ex/app/NPXS40087/psm/Application/app.exe.sprx
+/system/common/lib/libSceCustomMusicAudioOut.sprx
+/system/common/lib/libScePadTracker.sprx
+/system/common/lib/libSceAudiodec.sprx
+```
+
+### Not obtainable this way
+
+`/dev/mbus`, `/dev/mbus_av`, `/dev/cloudsd` and `/dev/cloudsd2` appear in the listing but
+are device nodes — there is no content to dump. They are reachable only through the
+modules that open them, which is why `libSceMbus.sprx` and `libSceCloudMessaging.sprx`
+lead the two halves of the list above.
+
+---
+
+## 13. Reproducing the analysis
+
+Tooling used was a small Python harness over `capstone`, with segment maps taken from each
+binary's program headers (`readelf -l`), since neither binary has section headers.
+`objdump -d` produces nothing on them for that reason; disassembly must be done on raw
+bytes at the right virtual address.
+
+Two traps worth flagging for anyone picking this up:
+
+- **Linear sweep misaligns.** A whole-image linear disassembly from offset 0 produces
+  phantom cross-references in places. Anything load-bearing should be re-read from a
+  confirmed function prologue (`55 48 89 e5`), not from the sweep.
+- **Function-start detection by `int3` padding is unreliable.** Several real functions sit
+  behind padding that the heuristic attributes to the previous function, and some jump
+  islands look like starts. `0x32420` in particular is the `ProsperoAudioDecoder`
+  constructor, not the port-open function; the port-open function is `0x32940`.
+
+Useful anchors:
+
+```
+client  0x84ec0   channel-id allocator          0x2511f0  feature predicate
+        0x31540   ProsperoAudioState ctor       0x31700   poll / FLAGS / ANGLE / HRTF / TVCONFIG
+        0x321e0   PORTSTATES                    0x32940   openDevice (port open)
+        0x33990   isPadSpeakerChannel           0x339c0   padIndexForChannel
+        0x2af530  Connection::sendAudioState    0x8fe60   mask clamp
+        0x251350/0x251370/0x2513c0              AV header size tables
+host    0x169910  feature predicate             0x21d5a0  declareChannel
+        0x21b720  AvCap init                    0x221b80  audio thread (main/haptic/padspk)
+        0x28ec8a  audioSettings JSON parser     0x21ac40  consumer destructor
+        0x1e0910  cloud constants init          0x1d8f10  /etc/gaikai-release read
+        0x30150   Gaikai string destructor      0x53a8a8  lane-name array (0x20 stride)
+        0x21c6ad/0x21c8ac  video consumer       0x21ca5d  main consumer
+        0x21cb78  haptic consumer               (no site) padspk consumer
+        0x21b810  AvCap setup (owns both gates) 0x21bfdc  capability(10) gate
+        0x21bf17  mixToMain gate                0x21c260  per-controller channel loop
+        0x28eca9  "mixToMain" key               0x28ee0d  "audioChannels" key
+        0x222a1f  mono-into-main mixer          0x53b2a8  host lane-name table
+        0x1e69d0  host channel-id allocator     0x21c420  writes channel +0x38
+        0x2239c0  submitFrame (gated on +0x38)  0x228210  map<id, channel*> helper
+        0x2258a0  setAvCapFactory (injected)    this+0x17e8  channel map
+        0x22f8b0  StreamCollectorSender ctor    0x22fd80  its type-filtered push
+        0x22faa7  accepted types {5,6,7,8}      0x2222cc  haptic readFrame (vtable+0x20)
+        0x2228b0  padspk readFrame              0x222891  the null test padspk dies on
+        0x4f65f0  capability jump table (12)    frame types: 2 haptic, 3 padspk
+daemon  0xb4320  output destinations (7)       0x1a290   its indexer
+        0xb4370  device/port types             0xb43a0   bus types (EXTRA_PAD0-3 at 9-12)
+        0xa4bfc  kind -> name-table jump       0x1d4d0   port info builder
+grant   session+0x1D8  channel-name list     0x21bc50  iterates it
+        0x21d5a0  per-channel defaults        0x205040  launchspec normalizer
+        0x1783e0  JSON remove-member          0x52e590  factory vtable (zero in file)
+ctrl    0x4f30c8  CTRL jump table             0x36cd3   its dispatch
+        0x36f69   type 0x11 platform ident    0x37066   type 0x13 DualSense feature
+        0x27810   client request builder      0x28136-0x28537  its schema keys
+        0x205290  host reads audioChannelType 0x1e5a0d  and again here
+```
